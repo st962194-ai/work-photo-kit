@@ -1,14 +1,14 @@
-/** 作業写真アプリ — 一括 LINE アルバムの純粋ロジック（selftest 対象） */
+/** 一括 LINE アルバムの純粋ロジック */
 
 export const LINE_CANVAS_MAX_WIDTH = 1200;
 export const LINE_CANVAS_MAX_HEIGHT = 6000;
 export const LINE_CANVAS_MAX_PIXELS = 7_200_000;
-export const LINE_ALBUM_MAX_POINTS = 4;
+export const LINE_ALBUM_MAX_POINTS = 1;
 export const LINE_HEADER_H = 110;
 export const LINE_FOOTER_H = 80;
 export const LINE_POINT_NAME_H = 36;
 export const LINE_LABEL_BAND_H = 44;
-export const LINE_POINT_IMAGE_H = 320;
+export const LINE_POINT_IMAGE_H = 620;
 export const LINE_POINT_GAP = 16;
 export const LINE_POINT_COL_GAP = 12;
 export const EXCLUDED_LINE_H = 22;
@@ -20,16 +20,23 @@ export const LINE_MESSAGE_PADDING = 16;
 export const LINE_MESSAGE_CHARS_PER_LINE = 28;
 export const LINE_ALBUM_LAYOUT = "job_before_after_grid_v1";
 
+function customerDisplayName(value) {
+  const name = String(value || "").trim();
+  if (!name) return "お客様名未入力";
+  if (name.endsWith("様")) return name;
+  return `${name}様`;
+}
+
 export function safeFilePart(value) {
   return String(value || "report").replace(/[\\/:*?"<>|]+/g, "_").slice(0, 80);
 }
 
-export function lineAlbumFilename(customerName, part, total) {
+export function lineAlbumFilename(_customerName, part, total) {
   const suffix = total > 1 ? `_${part}of${total}` : "";
-  return `${safeFilePart(customerName)}_LINE送信用${suffix}.jpg`;
+  return `作業写真${suffix}.jpg`;
 }
 
-/** 作業写真アプリ: 洗う場所ごとに Before/After は横並び1段 */
+/** 洗う場所ごとに Before/After は横並び1段 */
 export function estimatePointBlockHeight() {
   return LINE_POINT_NAME_H + LINE_LABEL_BAND_H + LINE_POINT_IMAGE_H + LINE_POINT_GAP;
 }
@@ -40,7 +47,7 @@ export function validateLineAlbumMessage(text) {
     return {
       ok: false,
       code: "empty",
-      message: "お礼文を入力してください。入力した文面は一括画像の冒頭に入ります。",
+      message: "お礼文を入力してください。入力した文面はLINE本文として画像の前に入ります。",
     };
   }
   if (trimmed.length > LINE_MESSAGE_MAX_CHARS) {
@@ -79,7 +86,6 @@ export function estimateMessageBlockHeight(messageText, maxCharsPerLine = LINE_M
   if (!lines.length) return 0;
   return (
     LINE_MESSAGE_PADDING +
-    LINE_MESSAGE_LABEL_H +
     lines.length * LINE_MESSAGE_LINE_H +
     LINE_MESSAGE_PADDING
   );
@@ -89,16 +95,14 @@ export function estimateAlbumCanvasHeight(
   pointCount,
   excludedLineCount,
   splitLabel = false,
-  messageText = ""
+  _messageText = ""
 ) {
   const splitH = splitLabel ? 36 : 0;
-  const messageH = estimateMessageBlockHeight(messageText);
   const excludedH =
     excludedLineCount > 0 ? EXCLUDED_HEADER_H + excludedLineCount * EXCLUDED_LINE_H : 0;
   return (
     LINE_HEADER_H +
     splitH +
-    messageH +
     pointCount * estimatePointBlockHeight() +
     excludedH +
     LINE_FOOTER_H
@@ -148,8 +152,8 @@ export function analyzeJobAlbumPointsFromPoints(dirtPoints) {
       continue;
     }
     let reason = "写真なし";
-    if (photos.before && !photos.after) reason = "After未登録";
-    else if (!photos.before && photos.after) reason = "Before未登録";
+    if (photos.before && !photos.after) reason = "After未撮影";
+    else if (!photos.before && photos.after) reason = "Before未撮影";
     else if (photos.process) reason = "作業中の写真のみ";
     excluded.push({ point, reason });
   }
@@ -160,15 +164,14 @@ export function planExcludedDisplay(
   excluded,
   pointCount,
   splitLabel = false,
-  messageText = ""
+  _messageText = ""
 ) {
   if (!excluded.length) {
     return { shown: [], omitted: 0, lineCount: 0 };
   }
   const splitH = splitLabel ? 36 : 0;
-  const messageH = estimateMessageBlockHeight(messageText);
   const baseH =
-    LINE_HEADER_H + splitH + messageH + pointCount * estimatePointBlockHeight() + LINE_FOOTER_H;
+    LINE_HEADER_H + splitH + pointCount * estimatePointBlockHeight() + LINE_FOOTER_H;
   const available = LINE_CANVAS_MAX_HEIGHT - baseH - EXCLUDED_HEADER_H;
   if (available < EXCLUDED_LINE_H) {
     return { shown: [], omitted: excluded.length, lineCount: 1 };
@@ -192,10 +195,9 @@ export function resolveAlbumCanvasHeight(
   pointCount,
   excludedPlan,
   splitLabel = false,
-  messageText = ""
+  _messageText = ""
 ) {
   const splitH = splitLabel ? 36 : 0;
-  const messageH = estimateMessageBlockHeight(messageText);
   const excludedLines =
     excludedPlan.omitted > 0
       ? excludedPlan.shown.length + 1
@@ -205,7 +207,6 @@ export function resolveAlbumCanvasHeight(
   const height =
     LINE_HEADER_H +
     splitH +
-    messageH +
     pointCount * estimatePointBlockHeight() +
     excludedH +
     LINE_FOOTER_H;
@@ -219,8 +220,9 @@ export function resolveAlbumCanvasHeight(
 }
 
 export function buildLineImageHeaderTexts(job, serviceLabelText = "") {
+  const customer = customerDisplayName(job?.customerName || "");
   return {
-    title: `${job.customerName} / ${serviceLabelText || job.serviceCode || ""}`,
+    title: `${customer} / ${serviceLabelText || job.serviceCode || ""}`,
     subtitle: `作業日: ${job.workDate || "-"}`,
   };
 }

@@ -29,22 +29,20 @@ import {
   buildLineImageHeaderTexts,
   buildAlbumContentFingerprint,
   validateLineAlbumMessage,
-  wrapMessageLines,
-  estimateMessageBlockHeight,
   isAlbumShareEnabled,
   albumPreviewStatusLabel,
   LINE_MESSAGE_MAX_CHARS,
-  LINE_MESSAGE_PADDING,
-  LINE_MESSAGE_LABEL_H,
-  LINE_MESSAGE_LINE_H,
   LINE_POINT_COL_GAP,
-} from "./lineAlbumLogic.js?v=20260530-2";
+} from "./lineAlbumLogic.js?v=20260601-01";
 
-const APP_BUILD = globalThis.R1A_BUILD || "20260530-2";
+const APP_BUILD = globalThis.R1A_BUILD || "20260601-01";
+const CUSTOMER_NAME_INPUT_PLACEHOLDER = "お客様名を入力";
+const CUSTOMER_NAME_PLACEHOLDER_TOKENS = ["お客様名を入力", "お客様名未入力"];
 const STORAGE_KEY = "photo_r1a_phase0";
 const TRIAL_JOB_ID = "sample-001";
 const SAMPLE_URL = "./data/dummy_jobs_phase0.json";
 const MAX_PHASE0_JOBS = 30;
+const MANUAL_JOB_SEQ_STORAGE_KEY = "photo_r1a_manual_job_seq_v1";
 const PHOTO_DB_NAME = "photo_r1a_trial_photos";
 const PHOTO_STORE = "photos";
 const PHOTO_MAX_EDGE = 1280;
@@ -53,22 +51,45 @@ const PHOTO_MAX_INPUT_BYTES = 15 * 1024 * 1024;
 const PHOTO_MAX_PIXELS = 24_000_000;
 const LINE_TARGET_BYTES = 4 * 1024 * 1024;
 const LINE_JPEG_QUALITIES = [0.9, 0.82, 0.74, 0.66, 0.58, 0.5];
-const LABEL_BEFORE_BG = "#424242";
+const LABEL_BEFORE_BG = "#ffffff";
+const LABEL_BEFORE_TEXT = "#1565C0";
 const LABEL_AFTER_BG = "#1565C0";
+const LABEL_AFTER_TEXT = "#ffffff";
 const CANVAS_FILL = "#eef2f6";
 const BETA_LOCAL_STORAGE_LABEL = "端末内";
 const DEFAULT_SERVICE_CODE = "WM_DRUM";
-const SERVICE_OPTIONS = [
-  { code: "WM_DRUM", label: "洗濯機（ドラム）" },
-  { code: "WM_VERT", label: "洗濯機（縦型）" },
-  { code: "AC_WALL", label: "エアコン（壁掛）" },
-  { code: "OTHER", label: "その他" },
+const CUSTOMER_NAME_EMPTY_LABEL = "お客様名未入力";
+const SERVICE_OPTION_GROUPS = [
+  {
+    label: "洗濯機",
+    options: [
+      { code: "WM_DRUM", label: "ドラム式洗濯機" },
+      { code: "WM_VERT", label: "縦型洗濯機" },
+      { code: "WM_OTHER", label: "コインランドリー/その他洗濯機" },
+    ],
+  },
+  {
+    label: "エアコン",
+    options: [
+      { code: "AC_WALL", label: "壁掛けエアコン" },
+      { code: "AC_CEIL", label: "天井埋込/セントラルエアコン" },
+    ],
+  },
+  {
+    label: "その他",
+    options: [{ code: "OTHER", label: "その他" }],
+  },
 ];
+const SERVICE_OPTIONS = SERVICE_OPTION_GROUPS.flatMap((group) => group.options);
 const PHOTO_SLOTS = [
-  { kind: "before", label: "ビフォー", lineLabel: "ビフォー" },
-  { kind: "after", label: "アフター", lineLabel: "アフター" },
+  { kind: "before", label: "Before", lineLabel: "Before" },
+  { kind: "after", label: "After", lineLabel: "After" },
   { kind: "process", label: "作業中の写真", lineLabel: "作業中" },
 ];
+const CUSTOMER_NAME_COLLATOR = new Intl.Collator("ja-JP", {
+  numeric: true,
+  sensitivity: "base",
+});
 const T = {
   tabToday: "今日 LINE で送る",
   tabJobs: "お客様一覧",
@@ -76,19 +97,190 @@ const T = {
   emptyToday: "本日、LINE で送るお客様はいません",
   badgeToday: "今日 LINE で送る",
   dirtPoint: "洗う場所",
-  photoVerified: { 未: "未確認", 済: "確認済み" },
+  photoVerified: { 未: "写真未確認", 済: "写真確認済み" },
   linePhotoSent: { 未: "未送信", 済: "送信済み", 不要: "不要" },
   todaySendTarget: { yes: "対象", no: "対象外" },
 };
 const DELETE_CONFIRM_MS = 5000;
-const LINE_TEST_TEMPLATE =
-  "作業が完了しました。洗浄前後のお写真をお送りします。";
-const TRIAL_ASSUMPTIONS = [
-  "iPhoneのSafariで使う前提です",
-  "予約管理は今の道具のままです",
-  "経理の記録とは分けて使います",
-  "LINEは自動送信せず、人が確認して送ります",
-];
+const LINE_TEST_TEMPLATE = "作業が完了しました。洗浄前後のお写真をお送りします。";
+const LINE_LEGACY_SIGNATURE_PATTERNS = [];
+const DETAIL_DRAFT_STORAGE_KEY = "photo_r1a_phase0_detail_draft_v1";
+const DETAIL_DRAFT_RESET_BUILD_KEY = "photo_r1a_detail_draft_reset_build";
+const DETAIL_DRAFT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+let detailAutoSaveTimer = 0;
+let detailDraftsByJob = new Map();
+
+function safeJsonParse(raw, fallback = null) {
+  try {
+    return raw == null ? fallback : JSON.parse(raw);
+  } catch {
+    return fallback;
+  }
+}
+
+function normalizeLineMessageText(value) {
+  let text = String(value || LINE_TEST_TEMPLATE);
+  for (const pattern of LINE_LEGACY_SIGNATURE_PATTERNS) {
+    text = text.replace(pattern, "");
+  }
+  text = text.replace(/\n{3,}/g, "\n\n").trim();
+  return text || LINE_TEST_TEMPLATE;
+}
+
+function loadDetailDrafts() {
+  try {
+    const raw = localStorage.getItem(DETAIL_DRAFT_STORAGE_KEY);
+    if (!raw) return;
+    const data = safeJsonParse(raw);
+    if (!data || typeof data !== "object" || Array.isArray(data)) return;
+    const now = Date.now();
+    Object.entries(data).forEach(([jobId, rawDraft]) => {
+      if (!jobId || !rawDraft || typeof rawDraft !== "object") return;
+      const updatedAt = Number(rawDraft.updatedAt);
+      if (!Number.isFinite(updatedAt) || now - updatedAt > DETAIL_DRAFT_TTL_MS) return;
+      detailDraftsByJob.set(String(jobId), { ...rawDraft, jobId: String(jobId) });
+    });
+  } catch {
+    detailDraftsByJob.clear();
+  }
+}
+
+function persistDetailDrafts() {
+  try {
+    const payload = Object.fromEntries(detailDraftsByJob.entries());
+    localStorage.setItem(DETAIL_DRAFT_STORAGE_KEY, JSON.stringify(payload));
+  } catch {
+    /* no-op */
+  }
+}
+
+function getDetailDraftForJob(jobId) {
+  if (!jobId) return null;
+  return detailDraftsByJob.get(String(jobId)) || null;
+}
+
+function getActiveDetailDraft(jobId) {
+  const draft = getDetailDraftForJob(jobId);
+  if (!draft) return null;
+  const updatedAt = Number(draft.updatedAt);
+  if (!Number.isFinite(updatedAt) || Date.now() - updatedAt > DETAIL_DRAFT_TTL_MS) {
+    clearDetailDraftForJob(jobId);
+    return null;
+  }
+  return draft;
+}
+
+function clearDetailDraftForJob(jobId) {
+  if (!jobId) return;
+  detailDraftsByJob.delete(String(jobId));
+  persistDetailDrafts();
+}
+
+function clearAllDetailDrafts() {
+  detailDraftsByJob.clear();
+  pendingDetailFormState = null;
+  persistDetailDrafts();
+}
+
+function resetLegacyDetailDraftsOnce() {
+  try {
+    const resetBuild = localStorage.getItem(DETAIL_DRAFT_RESET_BUILD_KEY);
+    if (resetBuild === APP_BUILD) return;
+    clearAllDetailDrafts();
+    localStorage.setItem(DETAIL_DRAFT_RESET_BUILD_KEY, APP_BUILD);
+  } catch {
+    clearAllDetailDrafts();
+  }
+}
+
+function prepareFreshJobForDetail(job) {
+  if (!job?.jobId) return;
+  cancelDetailAutoSave();
+  pendingDetailFormState = null;
+  clearDetailDraftForJob(job.jobId);
+}
+
+function rememberCurrentDetailFormState(job) {
+  const state = captureDetailFormState(job);
+  if (!state?.jobId) return;
+  pendingDetailFormState = state;
+}
+
+function setDetailDraftFromJob(job) {
+  if (!job?.jobId) return;
+  const draft = captureDetailDraft(job);
+  draft.updatedAt = Date.now();
+  draft.jobId = String(job.jobId);
+  detailDraftsByJob.set(draft.jobId, draft);
+  persistDetailDrafts();
+}
+
+function queueDetailAutoSave(job, delayMs = 120) {
+  if (!job) return;
+  if (detailAutoSaveTimer) {
+    window.clearTimeout(detailAutoSaveTimer);
+  }
+  detailAutoSaveTimer = window.setTimeout(() => {
+    syncDetailForm(job);
+    setDetailDraftFromJob(job);
+    saveLocal();
+  }, delayMs);
+}
+
+function cancelDetailAutoSave() {
+  if (!detailAutoSaveTimer) return;
+  window.clearTimeout(detailAutoSaveTimer);
+  detailAutoSaveTimer = 0;
+}
+
+function syncDetailForm(job) {
+  if (!job) return;
+  syncTopFormToJob(job);
+  syncPointsFromForm(job);
+}
+
+function blurActiveDetailInput() {
+  const active = document.activeElement;
+  if (!detailJobId || !active || !main.contains(active) || typeof active.blur !== "function") {
+    return;
+  }
+  active.blur();
+}
+
+function commitActiveDetailFormNow() {
+  const currentJob = findJob(detailJobId);
+  if (!currentJob) return false;
+  cancelDetailAutoSave();
+  syncDetailForm(currentJob);
+  rememberCurrentDetailFormState(currentJob);
+  setDetailDraftFromJob(currentJob);
+  saveLocal();
+  return true;
+}
+
+function commitActiveDetailFormBeforeLeaving() {
+  blurActiveDetailInput();
+  return commitActiveDetailFormNow();
+}
+
+function persistDetailFormState(job) {
+  if (!job) return;
+  syncDetailForm(job);
+  rememberCurrentDetailFormState(job);
+  setDetailDraftFromJob(job);
+  saveLocal();
+}
+
+function hydrateDetailFormState(job) {
+  if (!job?.jobId) return null;
+  const draft = getActiveDetailDraft(job.jobId);
+  const state = draft && draft.jobId === job.jobId ? draft : null;
+  const fallback = pendingDetailFormState;
+  const active = state || (fallback && fallback.jobId === job.jobId ? fallback : null);
+  if (!active) return null;
+  applyDetailFormStateToJob(job, active);
+  return active;
+}
 
 function createEmptyState() {
   return {
@@ -101,7 +293,7 @@ function createEmptyState() {
 
 let state = createEmptyState();
 
-let currentView = "today";
+let currentView = "jobs";
 let detailJobId = null;
 let lastSaveError = "";
 let lastSaveMessage = "";
@@ -110,11 +302,115 @@ let activePhotoUrls = [];
 /** @type {Map<string, { status: string, fingerprint: string, blobs: object[], previewUrls: string[], checkedAt: string|null }>} */
 const albumCheckCache = new Map();
 const albumSaveFallbackVisible = new Set();
+let pendingDetailFormState = null;
+let lastPointAddRunAt = 0;
+let customerNameInputComposing = false;
+let lastManualJobCreateAt = 0;
 
 const main = document.getElementById("app-main");
 const footer = document.getElementById("footer-status");
 const saveToast = document.getElementById("save-toast");
 const versionBanner = document.getElementById("version-banner");
+
+function captureDetailFormState(job) {
+  const customerEl = document.getElementById("f-customerName");
+  const serviceEl = document.getElementById("f-serviceCode");
+  const workDateEl = document.getElementById("f-workDate");
+  const sendPlannedDateEl = document.getElementById("f-sendPlannedDate");
+  const messageEl = document.getElementById("f-line-album-message");
+  const points = [...main.querySelectorAll("[data-point-row]")].map((row) => {
+    const pointIndex = Number(row.dataset.pointRow);
+    const point = job?.dirtPoints?.[pointIndex];
+    const pointNameEl = row.querySelector("[data-point-name-idx]");
+    const pointCheckedEl = row.querySelector("[data-point-idx]");
+    return {
+      pointId: point?.pointId || `${job?.jobId || ""}-P${String(pointIndex + 1).padStart(2, "0")}`,
+      name: pointNameEl ? pointNameEl.value : point?.name || `ポイント${pointIndex + 1}`,
+      manualCompletedChecked: pointCheckedEl ? pointCheckedEl.checked : false,
+    };
+  });
+  return {
+    jobId: job?.jobId || "",
+    customerName:
+      customerEl?.value !== undefined ? customerEl.value : (job?.customerName || ""),
+    serviceCode: serviceEl ? serviceEl.value : "",
+    workDate: workDateEl ? workDateEl.value : "",
+    sendPlannedDate: sendPlannedDateEl ? sendPlannedDateEl.value : "",
+    messageText: normalizeLineMessageText(messageEl ? messageEl.value : (job?.lineAlbum?.messageText || "")),
+    points,
+  };
+}
+
+function applyDetailFormStateToJob(job, formState) {
+  if (!job || !formState) return;
+  const customerInputValue = normalizeCustomerNameInput(formState.customerName);
+  if (customerInputValue) {
+    job.customerName = customerInputValue;
+  }
+  if (formState.serviceCode) {
+    job.serviceCode = formState.serviceCode;
+  }
+  const fallbackWorkDate = normalizeDateInputValue(job.workDate, todayYmd());
+  const formWorkDate = normalizeDateInputValue(formState.workDate, fallbackWorkDate);
+  const formSendDate = normalizeDateInputValue(formState.sendPlannedDate, formWorkDate);
+  job.workDate = formWorkDate;
+  job.sendPlannedDate = formSendDate < formWorkDate ? formWorkDate : formSendDate;
+  if (!job.lineAlbum) job.lineAlbum = {};
+  if (formState.messageText) {
+    job.lineAlbum.messageText = normalizeLineMessageText(formState.messageText);
+  }
+  if (Array.isArray(formState.points)) {
+    formState.points.forEach((pointState) => {
+      const point = job.dirtPoints?.find((item) => item.pointId === pointState.pointId);
+      if (!point) return;
+      point.name = pointState.name || point.name;
+      point.manualCompletedChecked = pointState.manualCompletedChecked === true;
+    });
+  }
+}
+
+function applyDetailFormStateToDom(job, formState) {
+  if (!formState || !job || formState.jobId !== job.jobId) return;
+  const topCustomerInput = document.getElementById("f-customerName");
+  if (topCustomerInput) {
+    topCustomerInput.value = formState.customerName || "";
+    if (!topCustomerInput.value) {
+      topCustomerInput.value = "";
+    }
+  }
+  const serviceEl = document.getElementById("f-serviceCode");
+  if (serviceEl && formState.serviceCode) {
+    serviceEl.value = formState.serviceCode;
+  }
+  const workDateEl = document.getElementById("f-workDate");
+  if (workDateEl) {
+    const workDate = normalizeDateInputValue(formState.workDate, job.workDate || todayYmd());
+    workDateEl.value = workDate;
+  }
+  const sendDateEl = document.getElementById("f-sendPlannedDate");
+  if (sendDateEl) {
+    const workDate = normalizeDateInputValue(workDateEl?.value, job.workDate || todayYmd());
+    const sendDate = normalizeDateInputValue(formState.sendPlannedDate, job.sendPlannedDate || workDate);
+    sendDateEl.value = sendDate < workDate ? workDate : sendDate;
+  }
+  const messageEl = document.getElementById("f-line-album-message");
+  if (messageEl && formState.messageText) {
+    messageEl.value = normalizeLineMessageText(formState.messageText);
+  }
+  const pointNames = [...main.querySelectorAll("[data-point-name-idx]")];
+  const pointChecks = [...main.querySelectorAll("[data-point-idx]")];
+  if (Array.isArray(formState.points)) {
+    formState.points.forEach((pointState) => {
+      const row = job.dirtPoints?.find((item) => item.pointId === pointState.pointId);
+      if (!row) return;
+      const pointIndex = job.dirtPoints.indexOf(row);
+      const nameEl = pointNames[pointIndex];
+      const checkEl = pointChecks[pointIndex];
+      if (nameEl) nameEl.value = pointState.name || nameEl.value;
+      if (checkEl) checkEl.checked = pointState.manualCompletedChecked;
+    });
+  }
+}
 
 function escapeHtml(s) {
   return String(s ?? "")
@@ -148,6 +444,170 @@ function assertCanvasLimits(width, height) {
 function asObject(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : {};
 }
+
+function trimOrEmpty(value) {
+  return String(value || "").trim();
+}
+
+function normalizeDateInputValue(value, fallback = "") {
+  const raw = String(value || "").trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw;
+  return /^\d{4}-\d{2}-\d{2}$/.test(String(fallback || "")) ? String(fallback) : "";
+}
+
+function normalizeCustomerNameInput(value) {
+  const name = trimOrEmpty(value);
+  return CUSTOMER_NAME_PLACEHOLDER_TOKENS.includes(name) ? "" : name;
+}
+
+function customerDisplayName(value) {
+  const name = trimOrEmpty(value);
+  if (!name) return CUSTOMER_NAME_EMPTY_LABEL;
+  if (name.endsWith("様")) return name;
+  return `${name}様`;
+}
+
+function renderCustomerName(value) {
+  return escapeHtml(customerDisplayName(value));
+}
+
+function renderCustomerNameHint(value) {
+  if (!trimOrEmpty(value)) {
+    return `<p class="card-meta">お客様名が未入力です。案件を開いて入力してください。</p>`;
+  }
+  return "";
+}
+
+function syncDetailFormToJob(job) {
+  if (!job) return;
+  syncTopFormToJob(job);
+  syncPointsFromForm(job);
+}
+
+function captureDetailDraft(job) {
+  const customerEl = document.getElementById("f-customerName");
+  const serviceEl = document.getElementById("f-serviceCode");
+  const workDateEl = document.getElementById("f-workDate");
+  const sendPlannedDateEl = document.getElementById("f-sendPlannedDate");
+  const messageEl = document.getElementById("f-line-album-message");
+  return {
+    customerName: normalizeCustomerNameInput(customerEl ? customerEl.value : job?.customerName || ""),
+    serviceCode: serviceEl ? serviceEl.value : job?.serviceCode || DEFAULT_SERVICE_CODE,
+    workDate: workDateEl ? workDateEl.value : job?.workDate || "",
+    sendPlannedDate: sendPlannedDateEl ? sendPlannedDateEl.value : job?.sendPlannedDate || "",
+    messageText: normalizeLineMessageText(messageEl ? messageEl.value : job?.lineAlbum?.messageText || LINE_TEST_TEMPLATE),
+    points: [...main.querySelectorAll("[data-point-row]")].map((row, order) => ({
+      order,
+      pointId: job?.dirtPoints?.[Number(row.dataset.pointRow)]?.pointId || "",
+      name: row.querySelector("[data-point-name-idx]")?.value || `ポイント${order + 1}`,
+      manualCompletedChecked: row.querySelector("[data-point-idx]")?.checked === true,
+    })),
+  };
+}
+
+function restoreDetailDraftToJob(job, draft) {
+  if (!job || !draft) return;
+  const hasCustomerField = Object.prototype.hasOwnProperty.call(draft, "customerName");
+  const draftCustomer = normalizeCustomerNameInput(draft.customerName);
+  if (hasCustomerField) {
+    job.customerName = draftCustomer;
+  }
+  job.serviceCode = SERVICE_CODE_SET.has(draft.serviceCode) ? draft.serviceCode : DEFAULT_SERVICE_CODE;
+  job.workDate = draft.workDate || "";
+  job.sendPlannedDate = draft.sendPlannedDate || "";
+  if (!job.lineAlbum) job.lineAlbum = {};
+  job.lineAlbum.messageText = normalizeLineMessageText(draft.messageText || LINE_TEST_TEMPLATE);
+  for (const savedPoint of draft.points || []) {
+    const point =
+      (savedPoint.pointId && job.dirtPoints?.find((item) => item.pointId === savedPoint.pointId)) ||
+      job.dirtPoints?.[savedPoint.order];
+    if (!point) continue;
+    point.name = String(savedPoint.name || "").trim() || `ポイント${savedPoint.order + 1}`;
+    point.manualCompletedChecked = savedPoint.manualCompletedChecked;
+  }
+}
+
+function restoreAndPersistDetailDraft(job, draft) {
+  if (!job || !draft) return false;
+  restoreDetailDraftToJob(job, draft);
+  draft.updatedAt = Date.now();
+  draft.jobId = String(job.jobId);
+  detailDraftsByJob.set(draft.jobId, draft);
+  persistDetailDrafts();
+  return saveLocal();
+}
+
+function hydrateDraftToJob(job) {
+  const draft = getActiveDetailDraft(job?.jobId);
+  if (!draft) return false;
+  restoreDetailDraftToJob(job, draft);
+  return true;
+}
+
+function clearCustomerPlaceholderValue(input) {
+  if (!input) return;
+  const value = trimOrEmpty(input.value);
+  if (CUSTOMER_NAME_PLACEHOLDER_TOKENS.includes(value)) {
+    input.value = "";
+  }
+}
+
+function clearCustomerPlaceholderOnInteraction(input) {
+  if (!input) return;
+  const handler = () => {
+    if (CUSTOMER_NAME_PLACEHOLDER_TOKENS.includes(trimOrEmpty(input.value))) {
+      input.value = "";
+    }
+  };
+  input.addEventListener("touchstart", handler, { passive: true });
+  input.addEventListener("pointerdown", handler);
+  input.addEventListener("focusin", handler);
+  input.addEventListener("focus", handler);
+  input.addEventListener("click", handler);
+}
+
+function wireCustomerNameInput(input, job) {
+  if (!input || !job) return;
+  clearCustomerPlaceholderOnInteraction(input);
+  input.addEventListener("compositionstart", () => {
+    customerNameInputComposing = true;
+    input.dataset.composing = "1";
+  });
+  input.addEventListener("compositionend", () => {
+    customerNameInputComposing = false;
+    input.dataset.composing = "";
+    persistDetailFormState(job);
+    queueDetailAutoSave(job, 0);
+    updateAlbumPanelUi(job);
+  });
+  input.addEventListener("change", () => {
+    customerNameInputComposing = false;
+    input.dataset.composing = "";
+    persistDetailFormState(job);
+    queueDetailAutoSave(job, 0);
+    updateAlbumPanelUi(job);
+  });
+  input.addEventListener("blur", () => {
+    if (customerNameInputComposing) return;
+    persistDetailFormState(job);
+    queueDetailAutoSave(job, 0);
+    updateAlbumPanelUi(job);
+  });
+  input.addEventListener("input", () => {
+    if (customerNameInputComposing || input.dataset.composing === "1") {
+      return;
+    }
+    persistDetailFormState(job);
+    queueDetailAutoSave(job, 0);
+    updateAlbumPanelUi(job);
+  });
+}
+
+function knownServiceCodeSet() {
+  return new Set(SERVICE_OPTIONS.map((item) => item.code));
+}
+
+const SERVICE_CODE_SET = knownServiceCodeSet();
 
 function newId(prefix) {
   if (globalThis.crypto?.randomUUID) return `${prefix}-${crypto.randomUUID()}`;
@@ -195,15 +655,19 @@ function normalizeJob(job, index) {
   const j = asObject(job);
   const rawJobId = String(j.jobId || "").trim();
   const jobId = rawJobId || `imported-${String(index + 1).padStart(3, "0")}`;
+  const rawCustomerName = trimOrEmpty(j.customerName);
+  const fallbackWorkDate = todayYmd();
+  const workDate = normalizeDateInputValue(j.workDate, fallbackWorkDate);
+  const sendPlannedDate = normalizeDateInputValue(j.sendPlannedDate, workDate);
   const dirtPoints = Array.isArray(j.dirtPoints)
     ? j.dirtPoints.map((p, i) => normalizePoint(p, i, jobId))
     : [];
   const la = asObject(j.lineAlbum);
   return {
     jobId,
-    workDate: String(j.workDate || ""),
-    sendPlannedDate: String(j.sendPlannedDate || ""),
-    customerName: String(j.customerName || "名称未設定"),
+    workDate,
+    sendPlannedDate: sendPlannedDate < workDate ? workDate : sendPlannedDate,
+    customerName: normalizeCustomerNameInput(rawCustomerName),
     serviceCode: String(j.serviceCode || ""),
     visitOrder: Number.isFinite(Number(j.visitOrder)) ? Number(j.visitOrder) : index + 1,
     status: String(j.status || ""),
@@ -212,7 +676,7 @@ function normalizeJob(job, index) {
     linePhotoSent: ["済", "不要"].includes(j.linePhotoSent) ? j.linePhotoSent : "未",
     lineThanksSent: ["済", "不要"].includes(j.lineThanksSent) ? j.lineThanksSent : "未",
     lineAlbum: {
-      messageText: String(la.messageText || LINE_TEST_TEMPLATE),
+      messageText: normalizeLineMessageText(la.messageText || LINE_TEST_TEMPLATE),
       messageSource: la.messageSource === "template" ? "template" : "manual",
       templateId: la.templateId ?? null,
       layout: "job_before_after_grid_v1",
@@ -245,7 +709,17 @@ function ensureState() {
     state = createEmptyState();
     return;
   }
-  state.jobs = state.jobs.map(normalizeJob);
+  state.jobs = state.jobs.map((job, index) => {
+    const normalized = normalizeJob(job, index);
+    if (!job || typeof job !== "object" || Array.isArray(job)) {
+      return normalized;
+    }
+    for (const key of Object.keys(job)) {
+      delete job[key];
+    }
+    Object.assign(job, normalized);
+    return job;
+  });
 }
 
 function safeJobs() {
@@ -279,8 +753,9 @@ function photoPairStatus(point) {
   const photos = normalizePhotoRefs(point?.photos);
   const hasBefore = Boolean(photos.before);
   const hasAfter = Boolean(photos.after);
-  if (hasBefore && hasAfter) return { label: "ビフォー/アフター OK", className: "badge-ok" };
-  if (hasBefore || hasAfter) return { label: "片方のみ", className: "badge-warn" };
+  if (hasBefore && hasAfter) return { label: "Before / After OK", className: "badge-ok" };
+  if (hasBefore && !hasAfter) return { label: "After未撮影", className: "badge-warn" };
+  if (!hasBefore && hasAfter) return { label: "Before未撮影", className: "badge-warn" };
   return { label: "写真なし", className: "badge-muted" };
 }
 
@@ -288,7 +763,7 @@ function jobPhotoSendWarnings(job) {
   const warnings = [];
   const points = Array.isArray(job?.dirtPoints) ? job.dirtPoints : [];
   if (points.length === 0) {
-    warnings.push("洗う場所がありません。ビフォー/アフターを登録してください。");
+    warnings.push("洗う場所がありません。Before / After を登録してください。");
     return warnings;
   }
   const completePairs = points.filter((point) => {
@@ -297,7 +772,7 @@ function jobPhotoSendWarnings(job) {
   }).length;
   if (completePairs === 0) {
     warnings.push(
-      "ビフォー と アフター が揃った場所がありません。「片方のみ」のままでは送る写真の確認（済）にしないでください。"
+      "Before と After が揃った場所がありません。未撮影の写真があるままでは送る写真の確認（済）にしないでください。"
     );
   }
   const partialOnly = points.some((point) => {
@@ -305,7 +780,7 @@ function jobPhotoSendWarnings(job) {
     return (photos.before && !photos.after) || (!photos.before && photos.after);
   });
   if (partialOnly) {
-    warnings.push("一部の洗う場所がビフォー/アフター 片方のみです。送る写真だけ選別できているか確認してください。");
+    warnings.push("一部の洗う場所に Before または After の未撮影があります。送る写真だけ選別できているか確認してください。");
   }
   const processCount = points.reduce((count, point) => {
     const photos = normalizePhotoRefs(point.photos);
@@ -321,42 +796,16 @@ function photoExportContextHint() {
   const ua = navigator.userAgent || "";
   const isAppleMobile = /iPhone|iPad|iPod/i.test(ua);
   if (isAppleMobile && window.isSecureContext) {
-    return "iPhoneでは「共有」からLINEを選びます。LINEが出ない場合は、一括画像を保存するか、プレビューをスクリーンショットしてLINEに添付してください。";
+    return "iPhoneでは出力ボタンから共有シートを開き、LINEを選びます。LINEが出ない場合は、表示された保存先に従ってファイル保存、またはプレビューをスクリーンショットしてLINEへ添付してください。";
   }
   if (window.isSecureContext) {
-    return "共有先にLINEが出ない場合は、画像チェック後の保存ボタン、またはプレビューのスクリーンショットからLINE添付で逃げられます。";
+    return "共有先にLINEが出ない場合は、出力後の保存先、またはプレビューのスクリーンショットからLINE添付で進めてください。";
   }
-  return "HTTP接続のため共有が使えない場合があります。送信用画像を保存 → 写真アプリ/Files → LINE添付を使ってください。";
+  return "HTTP接続のため共有が使えない場合があります。送信用画像を保存、またはスクリーンショットしてLINE添付を使ってください。";
 }
 
 function isAppleMobileDevice() {
   return /iPhone|iPad|iPod/i.test(navigator.userAgent || "");
-}
-
-function trialDeviceChecks() {
-  const shareSupported = canSharePhotoFiles();
-  return [
-    {
-      label: "iPhone / iPad",
-      ok: isAppleMobileDevice(),
-      note: isAppleMobileDevice() ? "この端末はiPhone / iPadです" : "この端末はiPhone / iPadではありません",
-    },
-    {
-      label: "HTTPS",
-      ok: window.isSecureContext,
-      note: window.isSecureContext ? "共有機能を使える接続です" : "ローカルHTTPでは共有できない場合があります",
-    },
-    {
-      label: "写真共有",
-      ok: shareSupported,
-      note: shareSupported ? "一括画像を共有できます" : "共有不可時は保存・スクショで送れます",
-    },
-    {
-      label: "端末保存",
-      ok: testLocalStorageWritable(),
-      note: testLocalStorageWritable() ? "入力内容をこの端末に保存できます" : "プライベートブラウズ等では保存できない可能性があります",
-    },
-  ];
 }
 
 function shareButtonSpec() {
@@ -383,7 +832,7 @@ function updatePhotoVerifyHint(job) {
   syncPointsFromForm(job);
   const warnings = jobPhotoSendWarnings(job);
   if (warnings.length === 0) {
-    el.textContent = "ビフォー/アフターが1組以上あれば、送る写真の確認（済）にできます。";
+    el.textContent = "Before / After が1組以上あれば、送る写真の確認（済）にできます。";
     el.className = "hint";
     return;
   }
@@ -462,12 +911,20 @@ function persistStateWithVerification(expectedChecks = []) {
   }
   for (const check of expectedChecks) {
     const job = stored.jobs.find((x) => x.jobId === check.jobId);
-    if (!job || job[check.field] !== check.value) {
+    if (!job) {
+      return {
+        ok: false,
+        stage: "verify",
+        message: `${check.jobId} が保存済み一覧に見つかりません。`,
+        actual: "(なし)",
+      };
+    }
+    if (job[check.field] !== check.value) {
       return {
         ok: false,
         stage: "verify",
         message: `${check.jobId} の ${check.field} が「${check.value}」ではありません。`,
-        actual: job ? job[check.field] : "(なし)",
+        actual: job[check.field],
       };
     }
   }
@@ -484,8 +941,8 @@ function collectSaveDiagnostics() {
   const lsWritable = testLocalStorageWritable();
   const raw = readStorageRaw();
   const stored = readStateFromStorage();
-  const sampleMem = findJob(TRIAL_JOB_ID);
-  const sampleStore = readJobFromStorage(TRIAL_JOB_ID);
+  const yamadaMem = findJob(TRIAL_JOB_ID);
+  const yamadaStore = readJobFromStorage(TRIAL_JOB_ID);
   const today = todayYmd();
   return {
     build: APP_BUILD,
@@ -494,12 +951,12 @@ function collectSaveDiagnostics() {
     lsWritable,
     hasStoredData: Boolean(raw),
     rawBytes: raw ? raw.length : 0,
-    sampleMemSent: sampleMem?.linePhotoSent ?? "(なし)",
-    sampleStoreSent: sampleStore?.linePhotoSent ?? "(なし)",
+    yamadaMemSent: yamadaMem?.linePhotoSent ?? "(なし)",
+    yamadaStoreSent: yamadaStore?.linePhotoSent ?? "(なし)",
     todayFromMem: safeTodaySend(today).length,
     todayFromStore: stored ? filterTodaySend(stored.jobs, today).length : "(読取不可)",
-    sampleInTodayMem: sampleMem ? isTodaySend(sampleMem, today) : false,
-    sampleInTodayStore: sampleStore ? isTodaySend(sampleStore, today) : false,
+    yamadaInTodayMem: yamadaMem ? isTodaySend(yamadaMem, today) : false,
+    yamadaInTodayStore: yamadaStore ? isTodaySend(yamadaStore, today) : false,
   };
 }
 
@@ -513,12 +970,12 @@ function renderSaveDiagnosticsHtml() {
       <dt>保存キー</dt><dd><code>${escapeHtml(d.storageKey)}</code></dd>
       <dt>localStorage 書込</dt><dd class="${okClass(d.lsWritable)}">${d.lsWritable ? "OK" : "NG"}</dd>
       <dt>保存データ</dt><dd class="${okClass(d.hasStoredData)}">${d.hasStoredData ? `あり（${d.rawBytes} bytes）` : "なし"}</dd>
-      <dt>サンプル顧客 linePhotoSent（メモリ）</dt><dd><code>${escapeHtml(String(d.sampleMemSent))}</code></dd>
-      <dt>サンプル顧客 linePhotoSent（保存実体）</dt><dd><code>${escapeHtml(String(d.sampleStoreSent))}</code></dd>
+      <dt>サンプル顧客 linePhotoSent（メモリ）</dt><dd><code>${escapeHtml(String(d.yamadaMemSent))}</code></dd>
+      <dt>サンプル顧客 linePhotoSent（保存実体）</dt><dd><code>${escapeHtml(String(d.yamadaStoreSent))}</code></dd>
       <dt>今日 LINE で送る件数（メモリ）</dt><dd><code>${d.todayFromMem}</code></dd>
       <dt>今日 LINE で送る件数（保存実体）</dt><dd><code>${escapeHtml(String(d.todayFromStore))}</code></dd>
-      <dt>サンプル顧客が今日 LINE で送る（メモリ）</dt><dd class="${okClass(!d.sampleInTodayMem)}">${d.sampleInTodayMem ? "表示中" : "非表示"}</dd>
-      <dt>サンプル顧客が今日 LINE で送る（保存実体）</dt><dd class="${okClass(!d.sampleInTodayStore)}">${d.sampleInTodayStore ? "表示中" : "非表示"}</dd>
+      <dt>サンプル顧客が今日 LINE で送る（メモリ）</dt><dd class="${okClass(!d.yamadaInTodayMem)}">${d.yamadaInTodayMem ? "表示中" : "非表示"}</dd>
+      <dt>サンプル顧客が今日 LINE で送る（保存実体）</dt><dd class="${okClass(!d.yamadaInTodayStore)}">${d.yamadaInTodayStore ? "表示中" : "非表示"}</dd>
     </dl>
   `;
 }
@@ -584,38 +1041,15 @@ function showPersistFailure(result) {
       : "";
   const msg =
     result.stage === "verify"
-      ? `画面上は変更しましたが、保存確認に失敗しました。再読み込みすると戻る可能性があります。（${result.message}${detail}）`
-      : `保存できていません。${result.message} 再読み込みすると戻る可能性があります。`;
+      ? `保存確認に失敗しました。入力内容は画面に残しています。必要ならもう一度操作してください。（${result.message}${detail}）`
+      : `保存できていません。${result.message} 入力内容は画面に残しています。`;
   showSaveFailure(msg);
   return msg;
-}
-
-function setSaveResultElement(message, type) {
-  const saveResult = document.getElementById("save-result");
-  if (!saveResult) return;
-  saveResult.hidden = false;
-  saveResult.textContent = message;
-  saveResult.className = `save-status save-status-${type}`;
-}
-
-function setSaveButtonBusy(button, busy, label = "保存中...") {
-  if (!button) return;
-  if (busy) {
-    button.dataset.originalText = button.textContent;
-    button.textContent = label;
-    button.disabled = true;
-    button.setAttribute("aria-busy", "true");
-    return;
-  }
-  button.textContent = button.dataset.originalText || "保存";
-  button.disabled = false;
-  button.removeAttribute("aria-busy");
 }
 
 function showSaveCanceled(message = "操作を取り消しました。保存していません。LINE写真は未送信のままです。") {
   showSaveToast(message, "warn");
   setDetailStatus(message, "warn");
-  setSaveResultElement(message, "warn");
   updateFooter();
 }
 
@@ -639,22 +1073,57 @@ function navigateToTodayView() {
   render();
 }
 
-function applyDetailFormToJob(job) {
+function syncTopFormToJob(job, options = {}) {
+  const { persist = false } = options;
   const customerEl = document.getElementById("f-customerName");
   if (customerEl) {
-    job.customerName = String(customerEl.value || "").trim() || "お客様名未入力";
+    const input = trimOrEmpty(customerEl.value);
+    job.customerName = normalizeCustomerNameInput(input);
   }
   const serviceEl = document.getElementById("f-serviceCode");
   if (serviceEl) {
     job.serviceCode = serviceEl.value || DEFAULT_SERVICE_CODE;
   }
-  job.workDate = document.getElementById("f-workDate").value;
-  job.sendPlannedDate = document.getElementById("f-sendPlannedDate").value;
-  job.photoStorage = document.getElementById("f-photoStorage")?.value || BETA_LOCAL_STORAGE_LABEL;
+  const workDateEl = document.getElementById("f-workDate");
+  if (workDateEl) {
+    job.workDate = workDateEl.value;
+  }
+  const sendPlannedDateEl = document.getElementById("f-sendPlannedDate");
+  if (sendPlannedDateEl) {
+    job.sendPlannedDate = sendPlannedDateEl.value;
+  }
+  const storageEl = document.getElementById("f-photoStorage");
+  if (storageEl) {
+    job.photoStorage = storageEl.value || BETA_LOCAL_STORAGE_LABEL;
+  }
+}
+
+function syncSendPlannedDateToWorkDate(job, options = {}) {
+  if (!job) return;
+  const { force = false } = options;
+  const workDateEl = document.getElementById("f-workDate");
+  const sendDateEl = document.getElementById("f-sendPlannedDate");
+  const workDate = workDateEl ? workDateEl.value : job.workDate || "";
+  if (sendDateEl) {
+    sendDateEl.min = workDate || "";
+    if (workDate && (force || !sendDateEl.value || sendDateEl.value < workDate)) {
+      sendDateEl.value = workDate;
+    }
+    job.sendPlannedDate = sendDateEl.value || workDate || "";
+  } else if (workDate && (force || !job.sendPlannedDate || job.sendPlannedDate < workDate)) {
+    job.sendPlannedDate = workDate;
+  }
+  if (workDate) {
+    job.workDate = workDate;
+  }
+}
+
+function applyDetailFormToJob(job) {
+  syncTopFormToJob(job, { persist: true });
   const messageEl = document.getElementById("f-line-album-message");
   if (messageEl) {
     if (!job.lineAlbum) job.lineAlbum = {};
-    job.lineAlbum.messageText = messageEl.value;
+    job.lineAlbum.messageText = normalizeLineMessageText(messageEl.value);
     job.lineAlbum.messageSource = "manual";
     job.lineAlbum.layout = "job_before_after_grid_v1";
   }
@@ -663,14 +1132,14 @@ function applyDetailFormToJob(job) {
 
 function getLineAlbumMessageText(job) {
   const el = document.getElementById("f-line-album-message");
-  if (el) return el.value;
-  return job.lineAlbum?.messageText || LINE_TEST_TEMPLATE;
+  if (el) return normalizeLineMessageText(el.value);
+  return normalizeLineMessageText(job.lineAlbum?.messageText || LINE_TEST_TEMPLATE);
 }
 
 function albumFilesFromBlobs(job, blobs) {
   return (blobs || []).map(
     (item) =>
-      new File([item.blob], lineAlbumFilename(job, item.part, item.total), { type: "image/jpeg" })
+      new File([item.blob], item.filename || lineAlbumFilename(job, item.part, item.total), { type: "image/jpeg" })
   );
 }
 
@@ -732,11 +1201,47 @@ function renderJobStatusBadges(job) {
   const sentClass = job.linePhotoSent === "済" ? "badge-ok" : "badge-muted";
   return `
     <div class="status-badges" aria-label="案件の状態">
-      <span class="status-badge"><span class="status-badge-label">送る写真</span><span class="badge ${verifiedClass}">${escapeHtml(verifiedLabel)}</span></span>
-      <span class="status-badge"><span class="status-badge-label">LINE写真</span><span class="badge ${sentClass}">${escapeHtml(sentLabel)}</span></span>
-      <span class="status-badge"><span class="status-badge-label">今日 LINE で送る</span><span class="badge ${sendClass}">${escapeHtml(sendTarget)}</span></span>
+      <span class="status-badge"><span class="status-badge-label">送信前チェック</span><span class="badge ${verifiedClass}">${escapeHtml(verifiedLabel)}</span></span>
+      <span class="status-badge"><span class="status-badge-label">LINE送信</span><span class="badge ${sentClass}">${escapeHtml(sentLabel)}</span></span>
+      <span class="status-badge"><span class="status-badge-label">本日の送信対象</span><span class="badge ${sendClass}">${escapeHtml(sendTarget)}</span></span>
     </div>
   `;
+}
+
+function sortDateValue(value) {
+  const raw = trimOrEmpty(value);
+  return raw || "9999-12-31";
+}
+
+function compareJobsForWorkDayList(a, b) {
+  const dateA = sortDateValue(a?.workDate);
+  const dateB = sortDateValue(b?.workDate);
+  if (dateA !== dateB) return dateA < dateB ? -1 : 1;
+  const nameA = customerDisplayName(a?.customerName || "");
+  const nameB = customerDisplayName(b?.customerName || "");
+  const byName = CUSTOMER_NAME_COLLATOR.compare(nameA, nameB);
+  if (byName !== 0) return byName;
+  return (a?.visitOrder || 0) - (b?.visitOrder || 0);
+}
+
+function isWorkDateOnOrBeforeToday(job) {
+  const workDate = sortDateValue(job?.workDate);
+  const today = todayYmd();
+  return workDate !== "9999-12-31" && workDate <= today;
+}
+
+function isJobDoneForList(job) {
+  return job?.status === "作業完了" || job?.linePhotoSent === "済";
+}
+
+function jobListCardState(job) {
+  const done = isJobDoneForList(job);
+  const pastOrToday = isWorkDateOnOrBeforeToday(job);
+  const classes = ["card", "job-card"];
+  if (done) classes.push("job-card-done");
+  else if (pastOrToday) classes.push("job-card-due");
+  const label = done ? "作業完了" : pastOrToday ? "当日以前" : "";
+  return { classes: classes.join(" "), label };
 }
 
 function handleMarkPhotoVerified(job) {
@@ -773,69 +1278,50 @@ function handleMarkPhotoVerified(job) {
   renderDetail();
 }
 
-function handleMarkLinePhotoSent(job) {
-  if (job.linePhotoSent === "済") {
-    setDetailStatus("すでに LINE写真=送信済み です。", "info");
-    return;
-  }
-  const confirmBox = document.getElementById("f-line-photo-sent-confirm");
-  if (!confirmBox?.checked) {
-    const msg =
-      "まだ今日 LINE で送る一覧から消していません。先に「自分用LINEへ送信済み」にチェックを入れてから、下の専用ボタンを押してください。";
-    showSaveToast(msg, "warn");
-    setDetailStatus(msg, "warn");
-    setSaveResultElement(msg, "warn");
-    return;
-  }
-
-  setDetailStatus("保存中です。画面を閉じずにお待ちください。", "info");
-  setSaveResultElement("保存中です。保存実体を読み戻して確認します。", "info");
-  const prev = job.linePhotoSent;
-  applyDetailFormToJob(job);
-  job.linePhotoSent = "済";
-
-  const result = persistStateWithVerification([
-    { jobId: job.jobId, field: "linePhotoSent", value: "済" },
-  ]);
-
-  if (!result.ok) {
-    job.linePhotoSent = prev;
-    const msg = showPersistFailure(result);
-    setDetailStatus(msg, "warn");
-    setSaveResultElement(msg, "fail");
-    return;
-  }
-
-  const evidence = buildPersistEvidence(job.jobId, result);
-  const msg = `完了しました。今日 LINE で送る一覧から消しました。LINE写真=送信済み · 今日 LINE で送る ${result.todayCount} 件`;
-  setFlashSaveMessage(msg);
-  setSaveResultElement(evidence, "ok");
-  alert(`${msg}\n\n${evidence}`);
-  navigateToTodayView();
-}
-
-function syncLinePhotoSentButton() {
-  const checkbox = document.getElementById("f-line-photo-sent-confirm");
-  const button = document.getElementById("btn-mark-line-photo-sent");
-  const status = document.getElementById("line-photo-sent-ready");
-  if (!checkbox || !button || !status) return;
-  const alreadySent = button.dataset.alreadySent === "true";
-  if (alreadySent) {
-    button.disabled = true;
-    status.textContent = "このお客様はすでに LINE写真=送信済み です。今日 LINE で送る一覧には出ません。";
-    status.className = "save-status save-status-ok";
-    return;
-  }
-  button.disabled = !checkbox.checked;
-  status.textContent = checkbox.checked
-    ? "準備OKです。下のボタンを押すと LINE写真=送信済み で保存し、今日 LINE で送る一覧から消します。"
-    : "まだ今日 LINE で送る一覧から消しません。LINE 送信後にチェックを入れてください。";
-  status.className = `save-status ${checkbox.checked ? "save-status-ok" : "save-status-warn"}`;
-}
-
 function verifySavedJobField(jobId, field, expected) {
   const job = readJobFromStorage(jobId);
   return Boolean(job && job[field] === expected);
+}
+
+function persistSimpleJobUpdate(message = "更新しました。") {
+  if (!saveLocal()) {
+    showSaveToast("更新内容を保存できませんでした。画面の内容は残しています。もう一度お試しください。", "warn");
+    return false;
+  }
+  setFlashSaveMessage(message);
+  return true;
+}
+
+function setSelectedJobsLinePhotoSent(jobIds, value) {
+  const ids = [...new Set((jobIds || []).map((id) => String(id || "").trim()).filter(Boolean))];
+  const jobs = ids.map((id) => findJob(id)).filter(Boolean);
+  if (!jobs.length) {
+    showSaveToast("対象のお客様が選択されていません。", "warn");
+    return;
+  }
+  for (const job of jobs) {
+    job.linePhotoSent = value;
+  }
+  const verb = value === "済" ? "今日 LINE で送る一覧から消しました。" : "今日 LINE で送る一覧に残しました。";
+  const saved = persistSimpleJobUpdate(`${jobs.length}件を${verb}`);
+  renderJobs();
+  if (saved) showSaveToast(`${jobs.length}件を${verb}`, "ok");
+}
+
+function markTodayJobComplete(jobId) {
+  const job = findJob(jobId);
+  if (!job) {
+    showSaveToast("対象のお客様が見つかりませんでした。", "warn");
+    renderToday();
+    return;
+  }
+  job.linePhotoSent = "済";
+  job.status = "作業完了";
+  const saved = persistSimpleJobUpdate(`${customerDisplayName(job.customerName)}を作業完了として今日の一覧から消しました。`);
+  renderToday();
+  if (saved) {
+    showSaveToast(`${customerDisplayName(job.customerName)}を今日の一覧から消しました。`, "ok");
+  }
 }
 
 function todayBannerHtml() {
@@ -850,7 +1336,7 @@ function saveLocal() {
     const serialized = JSON.stringify(state);
     localStorage.setItem(STORAGE_KEY, serialized);
     if (localStorage.getItem(STORAGE_KEY) !== serialized) {
-      throw new Error("保存後の読み戻し確認に失敗しました");
+      throw new Error("保存直後の確認に失敗しました");
     }
     lastSaveError = "";
     updateFooter();
@@ -1019,6 +1505,8 @@ async function loadSample() {
 }
 
 async function initData() {
+  loadDetailDrafts();
+  resetLegacyDetailDraftsOnce();
   if (!loadLocal()) {
     await loadSample();
   }
@@ -1028,7 +1516,7 @@ function updateFooter() {
   const today = todayYmd();
   const jobs = safeJobs();
   const n = safeTodaySend(today).length;
-  const build = "";
+  const build = ` · 版 ${APP_BUILD}`;
   const msg = lastSaveMessage ? ` · ${lastSaveMessage}` : "";
   footer.textContent = `今日 ${today}（${BUSINESS_TIME_ZONE}） · 今日 LINE で送る ${n} 件 · 全 ${jobs.length} 件${build}${msg}${lastSaveError}`;
 }
@@ -1052,6 +1540,9 @@ function setView(view) {
   }
   if (view === "data" && !isDevMode()) {
     view = "today";
+  }
+  if (detailJobId) {
+    commitActiveDetailFormBeforeLeaving();
   }
   currentView = view;
   detailJobId = null;
@@ -1087,29 +1578,51 @@ function serviceLabel(code) {
 }
 
 function serviceOptionsHtml(selectedCode) {
-  return SERVICE_OPTIONS.map(
-    (item) =>
-      `<option value="${escapeHtml(item.code)}" ${item.code === selectedCode ? "selected" : ""}>${escapeHtml(item.label)}</option>`
-  ).join("");
+  const safeSelected = selectedCode || "";
+  const hasSelected = SERVICE_CODE_SET.has(safeSelected);
+  const optionHtml = [];
+  if (safeSelected && !hasSelected) {
+    optionHtml.push(`<option value="${escapeHtml(safeSelected)}" selected>${escapeHtml(safeSelected)}（受け取った値）</option>`);
+  }
+  for (const group of SERVICE_OPTION_GROUPS) {
+    const groupOptions = group.options
+      .map(
+        (item) =>
+          `<option value="${escapeHtml(item.code)}" ${item.code === safeSelected ? "selected" : ""}>${escapeHtml(item.label)}</option>`
+      )
+      .join("");
+    optionHtml.push(`<optgroup label="${escapeHtml(group.label)}">${groupOptions}</optgroup>`);
+  }
+  return `<option value="" disabled ${!safeSelected ? "selected" : ""}>作業内容を選択</option>${optionHtml.join("")}`;
 }
 
 function nextManualJobId(date = todayYmd()) {
   const prefix = String(date || todayYmd()).replace(/-/g, "");
+  const seqMap = safeJsonParse(localStorage.getItem(MANUAL_JOB_SEQ_STORAGE_KEY), {});
+  const savedNext = Number(seqMap?.[prefix] || 0);
   const nums = safeJobs()
     .map((job) => String(job.jobId || ""))
     .filter((id) => id.startsWith(`${prefix}-`))
     .map((id) => Number(id.slice(prefix.length + 1)))
     .filter((n) => Number.isFinite(n));
-  let n = nums.length ? Math.max(...nums) + 1 : 1;
+  let n = Math.max(savedNext, nums.length ? Math.max(...nums) + 1 : 1);
   let id = `${prefix}-${String(n).padStart(3, "0")}`;
   while (findJob(id)) {
     n += 1;
     id = `${prefix}-${String(n).padStart(3, "0")}`;
   }
+  try {
+    localStorage.setItem(
+      MANUAL_JOB_SEQ_STORAGE_KEY,
+      JSON.stringify({ ...seqMap, [prefix]: n + 1 })
+    );
+  } catch {
+    /* no-op */
+  }
   return id;
 }
 
-function createManualJob() {
+function createManualJob(initial = {}) {
   const workDate = todayYmd();
   const jobId = nextManualJobId(workDate);
   return normalizeJob(
@@ -1117,8 +1630,8 @@ function createManualJob() {
       jobId,
       workDate,
       sendPlannedDate: workDate,
-      customerName: "お客様名を入力",
-      serviceCode: DEFAULT_SERVICE_CODE,
+      customerName: normalizeCustomerNameInput(initial.customerName || ""),
+      serviceCode: SERVICE_CODE_SET.has(initial.serviceCode) ? initial.serviceCode : DEFAULT_SERVICE_CODE,
       visitOrder: safeJobs().length + 1,
       status: "作業中",
       photoStorage: BETA_LOCAL_STORAGE_LABEL,
@@ -1146,114 +1659,98 @@ function createManualJob() {
   );
 }
 
-function betaTopActionsHtml() {
+function manualJobSavePanelHtml() {
   return `
-    <section class="beta-start-panel">
-      <div class="trial-kicker">作業写真をまとめる</div>
-      <button type="button" class="btn btn-primary" id="btn-add-manual-job">お客様を追加して始める</button>
-      <p class="hint">お客様名を手入力し、現場で写真を撮り、お礼文と一括画像をLINEへ手動で貼り付けます。</p>
-      <ul class="trial-assumptions">
-        ${TRIAL_ASSUMPTIONS.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}
-      </ul>
-    </section>
-  `;
-}
-
-function trialGuideHtml() {
-  return `
-    <section class="card trial-guide">
-      <h2>最初に試す流れ</h2>
-      <ol class="trial-steps">
-        <li><strong>お客様を追加して始める</strong> を押す</li>
-        <li>お客様名、作業内容、作業日を入れる</li>
-        <li>洗う場所ごとに ビフォー / アフター を撮る</li>
-        <li><strong>送る写真の確認が終わった</strong> を押す</li>
-        <li>お礼文を確認して <strong>画像チェック</strong></li>
-        <li><strong>一括画像を共有</strong> からLINEへ送る</li>
-        <li>送信後にチェックして <strong>LINE送信済みにして保存</strong></li>
-      </ol>
-    </section>
-  `;
-}
-
-function trialDeviceCheckHtml() {
-  const checks = trialDeviceChecks();
-  return `
-    <section class="card trial-device-check">
-      <h2>この端末で使える機能</h2>
-      <div class="check-list">
-        ${checks
-          .map(
-            (item) => `
-          <div class="check-row">
-            <span class="check-mark ${item.ok ? "check-ok" : "check-warn"}">${item.ok ? "OK" : "確認"}</span>
-            <div>
-              <strong>${escapeHtml(item.label)}</strong>
-              <p>${escapeHtml(item.note)}</p>
-            </div>
-          </div>`
-          )
-          .join("")}
+    <section class="card manual-create-panel">
+      <h2>新しいお客様を追加</h2>
+      <div class="field">
+        <label>お客様名</label>
+        <input type="text" id="f-new-customer-name" placeholder="例：サンプル様">
       </div>
-      <p class="hint">最終確認は、iPhoneのSafariとLINEで行います。</p>
+      <button type="button" class="btn btn-primary" id="btn-save-new-manual-job">この内容で1件保存</button>
+      <p class="hint">保存ボタンを押した時だけ、お客様一覧に1件追加します。</p>
     </section>
   `;
 }
 
-function wireManualJobButton() {
-  document.getElementById("btn-add-manual-job")?.addEventListener("click", () => {
-    if (safeJobs().length >= MAX_PHASE0_JOBS) {
-      alert(`このアプリで扱えるお客様データは最大 ${MAX_PHASE0_JOBS} 件です。送信済みデータを整理してください。`);
-      return;
-    }
-    const job = createManualJob();
-    state.jobs.push(job);
-    const saved = saveLocal();
-    detailJobId = job.jobId;
-    currentView = "jobs";
-    if (window.location.hash.startsWith("#job=")) {
-      history.replaceState(null, "", window.location.pathname + window.location.search);
-    }
-    setFlashSaveMessage(
-      saved
-        ? "新しいお客様を作成しました。お客様名と作業内容を入力してください。"
-        : "新しいお客様を画面上に作成しましたが、ブラウザ保存を確認できませんでした。"
-    );
-    renderDetail();
+function wireManualJobSaveForm() {
+  const input = document.getElementById("f-new-customer-name");
+  const btn = document.getElementById("btn-save-new-manual-job");
+  if (!input || !btn) return;
+  clearCustomerPlaceholderOnInteraction(input);
+  input.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    saveNewManualJobFromForm();
   });
+}
+
+function saveNewManualJobFromForm() {
+  const input = document.getElementById("f-new-customer-name");
+  const btn = document.getElementById("btn-save-new-manual-job");
+  if (!input || !btn) return;
+  const now = Date.now();
+  if (btn.disabled || now - lastManualJobCreateAt < 1500) return;
+  const customerName = normalizeCustomerNameInput(input.value);
+  if (!customerName) {
+    showSaveToast("お客様名を入力してから保存してください。", "warn");
+    input.focus();
+    return;
+  }
+  lastManualJobCreateAt = now;
+  btn.disabled = true;
+  if (safeJobs().length >= MAX_PHASE0_JOBS) {
+    alert(`このアプリで扱えるお客様データは最大 ${MAX_PHASE0_JOBS} 件です。送信済みデータを整理してください。`);
+    btn.disabled = false;
+    return;
+  }
+  const job = createManualJob({ customerName });
+  prepareFreshJobForDetail(job);
+  state.jobs.push(job);
+  const saved = saveLocal();
+  input.value = "";
+  detailJobId = job.jobId;
+  currentView = "jobs";
+  if (window.location.hash.startsWith("#job=")) {
+    history.replaceState(null, "", window.location.pathname + window.location.search);
+  }
+  setFlashSaveMessage(
+    saved
+      ? `${customerDisplayName(customerName)}を1件保存しました。`
+      : `${customerDisplayName(customerName)}を画面上に作成しましたが、ブラウザ保存を確認できませんでした。`
+  );
+  renderDetail();
 }
 
 function renderToday() {
   const today = todayYmd();
-  const list = safeTodaySend(today);
+  const list = [...safeTodaySend(today)].sort(compareJobsForWorkDayList);
   if (list.length === 0) {
     main.innerHTML = `
       ${todayBannerHtml()}
-      ${betaTopActionsHtml()}
-      ${trialGuideHtml()}
-      ${trialDeviceCheckHtml()}
       <p class="empty">${escapeHtml(T.emptyToday)}</p>
-      <p class="hint">条件: 送る写真=確認済み、LINE写真=未送信、作業日または送信予定日≦今日</p>
+      <p class="hint">条件: LINE写真=未送信、送信予定日が今日以前</p>
     `;
-    wireManualJobButton();
     return;
   }
   main.innerHTML =
     todayBannerHtml() +
-    betaTopActionsHtml() +
-    trialGuideHtml() +
-    trialDeviceCheckHtml() +
-    `<p class="hint">今日の対象日 · ${today} / ${BUSINESS_TIME_ZONE}</p>` +
+    `<p class="hint">今日 · ${today} / ${BUSINESS_TIME_ZONE}</p>` +
     list
       .map(
         (j) => `
-      <a class="card job-link" href="${jobHash(j.jobId)}" data-job="${escapeHtml(j.jobId)}">
+      <div class="card job-card">
         <span class="badge badge-send">${escapeHtml(T.badgeToday)}</span>
-        <h2>${escapeHtml(j.customerName)}</h2>
-        <p class="card-meta">${escapeHtml(serviceLabel(j.serviceCode))}</p>
+        <h2>${renderCustomerName(j.customerName)}</h2>
+        ${renderCustomerNameHint(j.customerName)}
+        <p class="card-meta">作業内容: ${escapeHtml(serviceLabel(j.serviceCode))}</p>
+        <p class="card-meta">${escapeHtml(j.workDate)} · ${escapeHtml(j.status || "")}</p>
         <p class="card-meta">LINE写真 ${escapeHtml(T.linePhotoSent[j.linePhotoSent] || j.linePhotoSent)} / 送る写真 ${escapeHtml(T.photoVerified[j.photoVerified] || j.photoVerified)}</p>
-        <p class="open-hint">タップして開く</p>
-      </a>`
+        <div class="btn-row job-card-actions">
+          <button type="button" class="btn btn-primary" data-job="${escapeHtml(j.jobId)}">開く</button>
+          <button type="button" class="btn" data-today-complete="${escapeHtml(j.jobId)}">作業完了として消す</button>
+        </div>
+      </div>`
       )
       .join("");
   main.querySelectorAll("[data-job]").forEach((el) => {
@@ -1263,30 +1760,56 @@ function renderToday() {
       window.location.hash = jobHash(el.dataset.job);
     });
   });
-  wireManualJobButton();
+  main.querySelectorAll("[data-today-complete]").forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      e.preventDefault();
+      markTodayJobComplete(btn.dataset.todayComplete);
+    });
+  });
 }
 
 function renderJobs() {
-  const sorted = [...safeJobs()].sort(
-    (a, b) => (a.visitOrder || 0) - (b.visitOrder || 0)
-  );
+  lastManualJobCreateAt = 0;
+  const sorted = [...safeJobs()].sort(compareJobsForWorkDayList);
   if (sorted.length === 0) {
-    main.innerHTML = `${betaTopActionsHtml()}${trialGuideHtml()}${trialDeviceCheckHtml()}<p class="empty">お客様データがありません</p>`;
-    wireManualJobButton();
+    main.innerHTML = `${manualJobSavePanelHtml()}<p class="empty">お客様データがありません</p>`;
+    wireManualJobSaveForm();
     return;
   }
-  main.innerHTML = betaTopActionsHtml() + trialGuideHtml() + trialDeviceCheckHtml() + sorted
+  main.innerHTML =
+    manualJobSavePanelHtml() +
+    `<div class="list-actions">
+      <p class="hint">送信済みのお客様は、確認後に選択して削除できます。</p>
+      <div class="btn-row" style="margin-bottom:0.6rem;">
+        <button type="button" class="btn btn-danger" id="btn-delete-selected-jobs">選択したお客様を削除</button>
+        <button type="button" class="btn btn-danger" id="btn-delete-all-jobs">お客様一覧を全削除</button>
+      </div>
+    </div>` +
+    sorted
     .map((j) => {
+      const cardState = jobListCardState(j);
       const send = isTodaySend(j) ? `<span class="badge badge-send">${escapeHtml(T.badgeToday)}</span> ` : "";
       const rate = completionRate(j);
       return `
-      <a class="card job-link" href="${jobHash(j.jobId)}" data-job="${escapeHtml(j.jobId)}">
-        ${send}<h2>${escapeHtml(j.customerName)}</h2>
-        <p class="card-meta">${escapeHtml(j.workDate)} · ${escapeHtml(j.status || "")}</p>
-        <p class="card-meta">送る写真 ${escapeHtml(T.photoVerified[j.photoVerified] || j.photoVerified)} / LINE写真 ${escapeHtml(T.linePhotoSent[j.linePhotoSent] || j.linePhotoSent)}</p>
-        <p class="rate">洗う場所 完了 ${rate.done}/${rate.total}（${rate.pct}%）</p>
-        <p class="open-hint">タップして開く</p>
-      </a>`;
+      <div class="${escapeHtml(cardState.classes)}">
+        <div class="job-card-head">
+          <div>${send}<h2>${renderCustomerName(j.customerName)}</h2></div>
+          ${cardState.label ? `<span class="badge badge-state">${escapeHtml(cardState.label)}</span>` : ""}
+        </div>
+        ${renderCustomerNameHint(j.customerName)}
+      <p class="card-meta">作業内容: ${escapeHtml(serviceLabel(j.serviceCode))}</p>
+      <p class="card-meta">${escapeHtml(j.workDate)} · ${escapeHtml(j.status || "")}</p>
+      <p class="card-meta">送る写真 ${escapeHtml(T.photoVerified[j.photoVerified] || j.photoVerified)} / LINE写真 ${escapeHtml(T.linePhotoSent[j.linePhotoSent] || j.linePhotoSent)}</p>
+      <p class="rate">洗う場所 作業完了 ${rate.done}/${rate.total}（${rate.pct}%）</p>
+      <label class="confirm-check" style="margin-top:0.45rem;">
+        <input type="checkbox" data-job-select="${escapeHtml(j.jobId)}" />
+        <span>このお客様を選択</span>
+      </label>
+      <div class="btn-row job-card-actions">
+        <button type="button" class="btn btn-primary" data-job="${escapeHtml(j.jobId)}">開く</button>
+          <button type="button" class="btn btn-danger" data-job-delete="${escapeHtml(j.jobId)}">このお客様だけ削除</button>
+        </div>
+      </div>`;
     })
     .join("");
   main.querySelectorAll("[data-job]").forEach((el) => {
@@ -1296,7 +1819,45 @@ function renderJobs() {
       window.location.hash = jobHash(el.dataset.job);
     });
   });
-  wireManualJobButton();
+  main.querySelectorAll("[data-job-delete]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const job = findJob(btn.dataset.jobDelete);
+      if (!job) return;
+      if (!armDeleteButton(btn)) return;
+      if (!confirm(`${customerDisplayName(job.customerName)} を削除しますか？\n\n写真も端末内から削除します。この操作は元に戻せません。`)) {
+        btn.textContent = btn.dataset.originalText || "削除";
+        btn.classList.remove("is-armed");
+        return;
+      }
+      await deleteJobById(job.jobId);
+    });
+  });
+  main.querySelectorAll("[data-job-select]").forEach((checkbox) => {
+    checkbox.addEventListener("change", () => {
+      const selectedCount = main.querySelectorAll("[data-job-select]:checked").length;
+      syncSelectedJobActionButtons(selectedCount);
+    });
+  });
+  const syncSelectedJobActionButtons = (selectedCount) => {
+    const deleteBtn = document.getElementById("btn-delete-selected-jobs");
+    if (deleteBtn) {
+      deleteBtn.disabled = selectedCount === 0;
+      deleteBtn.textContent = `選択したお客様を削除（${selectedCount}件）`;
+    }
+  };
+  const deleteSelectedBtn = document.getElementById("btn-delete-selected-jobs");
+  const selectedIds = () => [...main.querySelectorAll("[data-job-select]:checked")].map((item) => item.dataset.jobSelect);
+  syncSelectedJobActionButtons(0);
+  if (deleteSelectedBtn) {
+    deleteSelectedBtn.addEventListener("click", async () => {
+      const ids = selectedIds();
+      if (!ids.length) return;
+      if (!confirm(`選択した ${ids.length} 件を削除しますか？\n\n端末内写真もまとめて削除されます。戻せません。`)) return;
+      await deleteJobsByIds(ids);
+    });
+  }
+  document.getElementById("btn-delete-all-jobs")?.addEventListener("click", deleteAllJobs);
+  wireManualJobSaveForm();
 }
 
 function openDetail(jobId, options = {}) {
@@ -1305,7 +1866,7 @@ function openDetail(jobId, options = {}) {
   const shouldConfirm = options.confirmSwitch !== false && detailJobId !== jobId;
   if (
     shouldConfirm &&
-    !confirm(`${next.customerName}\n${next.jobId}\n\nこの案件を開きますか？`)
+    !confirm(`${renderCustomerName(next.customerName)}\n${next.jobId}\n\nこの案件を開きますか？`)
   ) {
     return;
   }
@@ -1315,6 +1876,122 @@ function openDetail(jobId, options = {}) {
 
 function findJob(id) {
   return safeJobs().find((j) => j.jobId === id);
+}
+
+function collectJobPhotoIds(job) {
+  const ids = [];
+  for (const point of job?.dirtPoints || []) {
+    const photos = normalizePhotoRefs(point.photos);
+    for (const slot of PHOTO_SLOTS) {
+      const photoId = photos[slot.kind]?.photoId;
+      if (photoId) ids.push(photoId);
+    }
+  }
+  return ids;
+}
+
+async function deleteJobPhotoBlobs(job) {
+  const failed = [];
+  for (const photoId of collectJobPhotoIds(job)) {
+    try {
+      await deletePhotoBlob(photoId);
+    } catch (e) {
+      console.warn("お客様写真本体の削除に失敗", photoId, e);
+      failed.push(photoId);
+    }
+  }
+  return failed;
+}
+
+async function deleteJobById(jobId) {
+  const job = findJob(jobId);
+  if (!job) return;
+  const failedDeletes = await deleteJobPhotoBlobs(job);
+  state.jobs = safeJobs().filter((item) => item.jobId !== jobId);
+  clearDetailDraftForJob(jobId);
+  albumCheckCache.delete(jobId);
+  albumSaveFallbackVisible.delete(jobId);
+  if (detailJobId === jobId) detailJobId = null;
+  const saved = saveLocal();
+  renderJobs();
+  if (!saved) {
+    alert("お客様は画面上で削除しましたが、ブラウザ保存に失敗しました。");
+  } else if (failedDeletes.length > 0) {
+    alert("お客様は削除しました。一部の写真本体だけ端末内に残った可能性があります。");
+  } else {
+    setFlashSaveMessage(`${customerDisplayName(job.customerName)} を削除しました。`);
+    renderJobs();
+  }
+}
+
+async function deleteJobsByIds(jobIds) {
+  const ids = [...new Set((jobIds || []).map((id) => String(id || "").trim()).filter(Boolean))];
+  if (!ids.length) {
+    showSaveToast("削除対象がありませんでした。", "warn");
+    return;
+  }
+
+  const jobs = ids
+    .map((id) => findJob(id))
+    .filter((job) => job?.jobId)
+    .filter((job, index, self) => self.findIndex((item) => item.jobId === job.jobId) === index);
+
+  if (!jobs.length) {
+    showSaveToast("削除対象が見つかりませんでした。", "warn");
+    return;
+  }
+
+  const failedDeletes = [];
+  for (const job of jobs) {
+    failedDeletes.push(...(await deleteJobPhotoBlobs(job)));
+  }
+
+  const idSet = new Set(jobs.map((job) => job.jobId));
+  state.jobs = safeJobs().filter((item) => !idSet.has(item.jobId));
+  jobs.forEach((job) => {
+    detailDraftsByJob.delete(job.jobId);
+    albumCheckCache.delete(job.jobId);
+    albumSaveFallbackVisible.delete(job.jobId);
+  });
+  persistDetailDrafts();
+  if (detailJobId && idSet.has(detailJobId)) {
+    detailJobId = null;
+  }
+
+  const saved = saveLocal();
+  renderJobs();
+
+  if (!saved) {
+    alert("選択したお客様は画面上で削除しましたが、ブラウザ保存に失敗しました。写真再読み込み後は復元される可能性があります。");
+    return;
+  }
+
+  const deletedCount = jobs.length;
+  setFlashSaveMessage(`${deletedCount}件のお客様を削除しました。`);
+  if (failedDeletes.length > 0) {
+    alert("お客様は削除しました。一部の写真本体だけ端末内に残った可能性があります。");
+  }
+}
+
+async function deleteAllJobs() {
+  if (!confirm("お客様一覧をすべて削除しますか？\n\n端末内に保存した写真も削除します。この操作は元に戻せません。")) return;
+  if (!confirm("本当に全削除しますか？\n\n必要なら先にJSONをダウンロードしてください。")) return;
+  const jobs = [...safeJobs()];
+  const failedDeletes = [];
+  for (const job of jobs) {
+    failedDeletes.push(...(await deleteJobPhotoBlobs(job)));
+  }
+  state.jobs = [];
+  detailJobId = null;
+  clearAllDetailDrafts();
+  albumCheckCache.clear();
+  albumSaveFallbackVisible.clear();
+  const saved = saveLocal();
+  setFlashSaveMessage(saved ? "お客様一覧をすべて削除しました。" : "全削除しましたが、ブラウザ保存に失敗しました。");
+  renderJobs();
+  if (failedDeletes.length > 0) {
+    alert("全削除しました。一部の写真本体だけ端末内に残った可能性があります。");
+  }
 }
 
 function renderPhotoSlots(point, pointIndex) {
@@ -1333,7 +2010,7 @@ function renderPhotoSlots(point, pointIndex) {
         const ref = photos[slot.kind];
         const key = `${pointIndex}:${slot.kind}`;
         const processNote = isProcess(slot.kind)
-          ? `<p class="hint hint-warn">作業中の写真の LINE 単体出力は Phase 1 で対応予定です。</p>`
+          ? `<p class="hint">作業中の写真も画像チェックと一括画像に反映されます。</p>`
           : "";
         return `
         <div class="photo-slot">
@@ -1355,39 +2032,34 @@ function renderPhotoSlots(point, pointIndex) {
             </label>
           </div>
           ${processNote}
-          ${
-            ref && rawShareDev && !isProcess(slot.kind)
-              ? `<div class="photo-export-row">
-            <button type="button" class="btn btn-small" data-photo-share="${key}" ${
-                  shareBtn.disabled ? "disabled" : ""
-                } title="開発者モード: 生写真共有（お客様送付禁止）">${escapeHtml(shareBtn.label)}（開発者）</button>
+        ${
+          copyDev && ref
+            ? `<div class="photo-export-row">
+            <button type="button" class="btn btn-small" data-point-line-export="${key}" ${
+              shareBtn.disabled ? "disabled" : ""
+            } title="開発者モード: 生写真を共有/保存（お客様送付禁止）">送信用画像を共有/保存（開発者）</button>
             ${
-              copyDev
+              !isProcess(slot.kind)
                 ? `<button type="button" class="btn btn-small" data-photo-copy="${key}" title="開発者モード: PC向けコピー">コピー（開発者）</button>`
                 : ""
             }
           </div>`
-              : copyDev && ref && !isProcess(slot.kind)
-                ? `<div class="photo-export-row">
-            <button type="button" class="btn btn-small" data-photo-copy="${key}" title="開発者モード: PC向けコピー">コピー（開発者）</button>
-          </div>`
                 : ""
-          }
-        </div>`;
+        }
+      </div>`;
       }).join("")}
     </div>
     ${
       isDevMode()
         ? `<div class="line-image-panel">
-      <h3>LINE送信用画像（この洗う場所）</h3>
-      <p class="hint">開発者確認用。通常画面では「このお客様分を1枚にまとめる」だけを使います。</p>
+      <h3>送る画像（この洗う場所）</h3>
+      <p class="hint">開発者確認用。通常は「このお客様分を1枚にまとめる」だけを使います。</p>
       <div class="btn-row">
-        <button type="button" class="btn btn-small" data-line-image-save="${pointIndex}" ${hasBeforeAfter ? "" : "disabled"}>送信用画像を保存</button>
-        <button type="button" class="btn btn-small" data-line-image-share="${pointIndex}" ${
-          hasBeforeAfter && !shareBtn.disabled ? "" : "disabled"
-        } title="${escapeHtml(shareBtn.title)}">${shareBtn.disabled ? "送信用画像共有不可" : "送信用画像を共有"}</button>
+        <button type="button" class="btn btn-small" data-line-image-export="${pointIndex}" ${
+          hasBeforeAfter ? "" : "disabled"
+        } title="${escapeHtml(shareBtn.title)}">送信用画像を共有/保存</button>
       </div>
-      ${hasBeforeAfter ? "" : `<p class="hint hint-warn">ビフォーとアフターが揃うと作成できます。</p>`}
+      ${hasBeforeAfter ? "" : `<p class="hint hint-warn">Before / After が揃うと作成できます。</p>`}
     </div>`
         : ""
     }
@@ -1400,31 +2072,6 @@ function parsePhotoActionKey(raw) {
 }
 
 function wirePhotoExportHandlers(job) {
-  main.querySelectorAll("[data-photo-share]").forEach((btn) => {
-    btn.addEventListener("click", async () => {
-      if (btn.disabled) {
-        setDetailStatus("共有不可です。保存 → 写真アプリ → LINE添付を使ってください。", "warn");
-        return;
-      }
-      const { pointIndex, kind } = parsePhotoActionKey(btn.dataset.photoShare);
-      try {
-        const mode = await sharePhotoForLine(job, pointIndex, kind);
-        setDetailStatus(
-          mode === "share"
-            ? "共有画面を開きました。LINE を選んで送信してください。"
-            : "共有不可のため保存に切り替えました。写真アプリから LINE に添付してください。",
-          mode === "share" ? "ok" : "warn"
-        );
-      } catch (e) {
-        if (e?.name === "AbortError") {
-          setDetailStatus("共有をキャンセルしました。", "warn");
-          return;
-        }
-        setDetailStatus(`共有に失敗しました: ${e.message}`, "warn");
-      }
-    });
-  });
-
   main.querySelectorAll("[data-photo-copy]").forEach((btn) => {
     btn.addEventListener("click", async () => {
       if (btn.disabled) {
@@ -1441,41 +2088,22 @@ function wirePhotoExportHandlers(job) {
     });
   });
 
-  main.querySelectorAll("[data-line-image-save]").forEach((btn) => {
+  main.querySelectorAll("[data-point-line-export]").forEach((btn) => {
     btn.addEventListener("click", async () => {
       if (btn.disabled) {
-        setDetailStatus("ビフォーとアフターが揃っていないため、送信用画像を作れません。", "warn");
+        setDetailStatus("Before / After が揃っていないため、送信用画像を作れません。", "warn");
         return;
       }
       try {
-        const { filename, size } = await downloadLineCompositeForPoint(job, Number(btn.dataset.lineImageSave));
-        setDetailStatus(`送信用画像を保存しました: ${filename}（${Math.round(size / 1024)}KB）`, "ok");
+        const { pointIndex } = parsePhotoActionKey(btn.dataset.pointLineExport);
+        const result = await shareLineCompositeForPoint(job, Number(pointIndex));
+        if (result.mode === "share") {
+          setDetailStatus("送信用画像の共有画面を開きました。送信前提で選択してください。", "ok");
+        } else {
+          setDetailStatus("共有が難しい端末のため保存しました。", "ok");
+        }
       } catch (e) {
         setDetailStatus(`送信用画像の作成に失敗しました: ${e.message}`, "warn");
-      }
-    });
-  });
-
-  main.querySelectorAll("[data-line-image-share]").forEach((btn) => {
-    btn.addEventListener("click", async () => {
-      if (btn.disabled) {
-        setDetailStatus("共有不可です。送信用画像を保存 → 写真アプリ → LINE添付を使ってください。", "warn");
-        return;
-      }
-      try {
-        const result = await shareLineCompositeForPoint(job, Number(btn.dataset.lineImageShare));
-        setDetailStatus(
-          result.mode === "share"
-            ? `共有画面を開きました（${Math.round(result.size / 1024)}KB）。LINE を選んで送信してください。送信済みにはしません。`
-            : "共有不可のため保存に切り替えました。写真アプリから LINE に添付してください。",
-          result.mode === "share" ? "ok" : "warn"
-        );
-      } catch (e) {
-        if (e?.name === "AbortError") {
-          setDetailStatus("共有をキャンセルしました。", "warn");
-          return;
-        }
-        setDetailStatus(`送信用画像の共有に失敗しました: ${e.message}`, "warn");
       }
     });
   });
@@ -1527,13 +2155,50 @@ function syncPointsFromForm(job) {
   });
 }
 
-function verifyPhotoRefInStorage(jobId, pointIndex, kind, expectedPhotoId) {
+function verifyPhotoRefInStorage(jobId, pointIndex, kind, expectedPhotoId, pointId = "") {
   const stored = readStateFromStorage();
   if (!stored) return false;
   const job = stored.jobs.find((x) => x.jobId === jobId);
-  const point = job?.dirtPoints?.[pointIndex];
+  const point =
+    (pointId && job?.dirtPoints?.find((item) => item.pointId === pointId)) ||
+    job?.dirtPoints?.[pointIndex];
   const ref = normalizePhotoRefs(point?.photos)[kind];
   return (ref?.photoId || null) === (expectedPhotoId || null);
+}
+
+function repairPhotoRefInStorage(job, pointIndex, kind, expectedRef, pointId = "") {
+  const stored = readStateFromStorage();
+  if (!stored || !expectedRef?.photoId) return false;
+  const storedJob = stored.jobs.find((x) => x.jobId === job.jobId);
+  if (!storedJob) return false;
+  storedJob.customerName = job.customerName;
+  storedJob.serviceCode = job.serviceCode;
+  storedJob.workDate = job.workDate;
+  storedJob.sendPlannedDate = job.sendPlannedDate;
+  storedJob.photoStorage = job.photoStorage;
+  storedJob.lineAlbum = { ...storedJob.lineAlbum, ...job.lineAlbum };
+  const storedPoint =
+    (pointId && storedJob.dirtPoints?.find((item) => item.pointId === pointId)) ||
+    storedJob.dirtPoints?.[pointIndex];
+  const sourcePoint =
+    (pointId && job.dirtPoints?.find((item) => item.pointId === pointId)) ||
+    job.dirtPoints?.[pointIndex];
+  if (!storedPoint || !sourcePoint) return false;
+  storedPoint.name = sourcePoint.name;
+  storedPoint.manualCompletedChecked = sourcePoint.manualCompletedChecked;
+  storedPoint.photos = normalizePhotoRefs(storedPoint.photos);
+  storedPoint.photos[kind] = { ...expectedRef };
+  state = stored;
+  if (!saveLocal()) return false;
+  return verifyPhotoRefInStorage(job.jobId, pointIndex, kind, expectedRef.photoId, pointId);
+}
+
+function ensurePhotoRefPersisted(job, pointIndex, kind, expectedRef, pointId = "") {
+  if (verifyPhotoRefInStorage(job.jobId, pointIndex, kind, expectedRef?.photoId, pointId)) {
+    return { ok: true, repaired: false };
+  }
+  const repaired = repairPhotoRefInStorage(job, pointIndex, kind, expectedRef, pointId);
+  return { ok: repaired, repaired };
 }
 
 async function rollbackNewPhoto(job, pointIndex, point, kind, newRef, restoreRef) {
@@ -1545,18 +2210,24 @@ async function rollbackNewPhoto(job, pointIndex, point, kind, newRef, restoreRef
     console.warn("新写真のロールバック削除に失敗", newRef.photoId, e);
   }
   if (!saveLocal()) return false;
-  return verifyPhotoRefInStorage(job.jobId, pointIndex, kind, restoreRef?.photoId || null);
+  return verifyPhotoRefInStorage(job.jobId, pointIndex, kind, restoreRef?.photoId || null, point.pointId);
 }
 
 async function handlePhotoInput(job, pointIndex, kind, file) {
+  cancelDetailAutoSave();
+  const draft = captureDetailDraft(job);
   let point = null;
   let oldRef = null;
   let ref = null;
   let swapped = false;
+  let pointId = "";
   try {
-    syncPointsFromForm(job);
+    syncDetailFormToJob(job);
+    restoreDetailDraftToJob(job, draft);
+    setDetailDraftFromJob(job);
     point = job.dirtPoints[pointIndex];
     if (!point || !PHOTO_SLOTS.some((slot) => slot.kind === kind)) return;
+    pointId = point.pointId;
     const blob = await compressPhoto(file);
     point.photos = normalizePhotoRefs(point.photos);
     oldRef = point.photos[kind] ? { ...point.photos[kind] } : null;
@@ -1577,6 +2248,7 @@ async function handlePhotoInput(job, pointIndex, kind, file) {
 
     if (!saveLocal()) {
       const restored = await rollbackNewPhoto(job, pointIndex, point, kind, ref, oldRef);
+      restoreAndPersistDetailDraft(job, draft);
       alert(
         restored
           ? "写真本体は保存しましたが、メタ情報の保存に失敗しました。旧写真に戻しました。"
@@ -1586,12 +2258,14 @@ async function handlePhotoInput(job, pointIndex, kind, file) {
       return;
     }
 
-    if (!verifyPhotoRefInStorage(job.jobId, pointIndex, kind, ref.photoId)) {
+    const persistResult = ensurePhotoRefPersisted(job, pointIndex, kind, ref, pointId);
+    if (!persistResult.ok) {
       const restored = await rollbackNewPhoto(job, pointIndex, point, kind, ref, oldRef);
+      restoreAndPersistDetailDraft(job, draft);
       alert(
         restored
-          ? "保存後の読み戻し確認に失敗しました。旧写真に戻しました。"
-          : "保存後の読み戻し確認に失敗しました。旧写真への復帰保存も確認できませんでした。"
+          ? "写真の保存確認が完了できなかったため、写真だけ旧状態に戻しました。入力したお客様名は保持しています。"
+          : "写真の保存確認が完了できず、旧写真への復帰保存も確認できませんでした。入力したお客様名は保持しています。"
       );
       renderDetail();
       return;
@@ -1607,7 +2281,12 @@ async function handlePhotoInput(job, pointIndex, kind, file) {
 
     const stored = readStateFromStorage();
     if (stored) state = stored;
+    const latestJob = findJob(job.jobId) || job;
+    restoreAndPersistDetailDraft(latestJob, draft);
     markAlbumStale(job.jobId);
+    if (persistResult.repaired) {
+      setFlashSaveMessage("写真保存を自動修復して保存しました。");
+    }
     renderDetail();
   } catch (e) {
     if (ref?.photoId) {
@@ -1621,6 +2300,7 @@ async function handlePhotoInput(job, pointIndex, kind, file) {
         }
       }
     }
+    restoreAndPersistDetailDraft(job, draft);
     alert("写真の保存に失敗しました: " + e.message);
     if (swapped) renderDetail();
   }
@@ -1628,7 +2308,8 @@ async function handlePhotoInput(job, pointIndex, kind, file) {
 
 async function handlePhotoDelete(job, pointIndex, kind) {
   try {
-    syncPointsFromForm(job);
+    cancelDetailAutoSave();
+    syncDetailFormToJob(job);
     const point = job.dirtPoints[pointIndex];
     if (!point) return;
     point.photos = normalizePhotoRefs(point.photos);
@@ -1646,7 +2327,8 @@ async function handlePhotoDelete(job, pointIndex, kind) {
 
 async function handlePointDelete(job, idx) {
   try {
-    syncPointsFromForm(job);
+    cancelDetailAutoSave();
+    syncDetailFormToJob(job);
     const point = job.dirtPoints[idx];
     if (!point) return;
     const photoIds = PHOTO_SLOTS.map((slot) => point.photos?.[slot.kind]?.photoId).filter(Boolean);
@@ -1675,6 +2357,46 @@ async function handlePointDelete(job, idx) {
   } catch (e) {
     alert("ポイントの削除に失敗しました: " + e.message);
   }
+}
+
+function handlePointAdd(job) {
+  if (!job) return;
+  cancelDetailAutoSave();
+  const draft = captureDetailDraft(job);
+  syncDetailForm(job);
+  const idx = Array.isArray(job.dirtPoints) ? job.dirtPoints.length : 0;
+  if (!Array.isArray(job.dirtPoints)) job.dirtPoints = [];
+  const point = normalizePoint({ name: `洗う場所${idx + 1}` }, idx, job.jobId);
+  job.dirtPoints.push(point);
+  const nextDraft = {
+    ...draft,
+    jobId: String(job.jobId),
+    updatedAt: Date.now(),
+    points: [
+      ...(Array.isArray(draft.points) ? draft.points : []),
+      {
+        order: idx,
+        pointId: point.pointId,
+        name: point.name,
+        manualCompletedChecked: false,
+      },
+    ],
+  };
+  restoreDetailDraftToJob(job, nextDraft);
+  detailDraftsByJob.set(nextDraft.jobId, nextDraft);
+  persistDetailDrafts();
+  markAlbumStale(job.jobId);
+  saveLocal();
+  renderDetail();
+  window.setTimeout(() => {
+    const latestJob = findJob(job.jobId);
+    if (!latestJob) return;
+    const expectedCount = nextDraft.points.length;
+    const actualCount = Array.isArray(latestJob.dirtPoints) ? latestJob.dirtPoints.length : 0;
+    if (actualCount >= expectedCount) return;
+    restoreAndPersistDetailDraft(latestJob, nextDraft);
+    if (detailJobId === latestJob.jobId) renderDetail();
+  }, 0);
 }
 
 async function clearAllPhotoRefs() {
@@ -1731,7 +2453,7 @@ async function buildJobReportContentHtml(job) {
     pointHtml.push(`
       <section class="card">
         <h2>${escapeHtml(point.name)}</h2>
-        <p class="meta">完了: ${point.manualCompletedChecked ? "済" : "未"}</p>
+        <p class="meta">作業完了: ${point.manualCompletedChecked ? "済" : "未"}</p>
         <div class="grid">${slotHtml.join("")}</div>
       </section>
     `);
@@ -1779,8 +2501,13 @@ async function loadPointImages(entry) {
   const beforeBlob = await getPhotoBlob(entry.photos.before.photoId);
   const afterBlob = await getPhotoBlob(entry.photos.after.photoId);
   if (!beforeBlob || !afterBlob) throw new Error(`${entry.point.name} の写真データがありません`);
-  const [beforeImg, afterImg] = await Promise.all([loadImage(beforeBlob), loadImage(afterBlob)]);
-  return { beforeImg, afterImg };
+  const processBlob = entry.photos.process?.photoId ? await getPhotoBlob(entry.photos.process.photoId) : null;
+  const [beforeImg, afterImg, processImg] = await Promise.all([
+    loadImage(beforeBlob),
+    loadImage(afterBlob),
+    processBlob ? loadImage(processBlob) : Promise.resolve(null),
+  ]);
+  return { beforeImg, afterImg, processImg };
 }
 
 function photoSlotLabel(kind) {
@@ -1792,7 +2519,7 @@ function photoExportFilename(job, point, kind) {
 }
 
 function lineCompositeFilename(job, point) {
-  return `${safeFilePart(job.customerName)}_${safeFilePart(point.name)}_LINE送信用.jpg`;
+  return `${safeFilePart(point.name || "作業写真")}.jpg`;
 }
 
 function drawContainImage(ctx, img, x, y, w, h, bg = CANVAS_FILL) {
@@ -1807,10 +2534,38 @@ function drawContainImage(ctx, img, x, y, w, h, bg = CANVAS_FILL) {
   ctx.drawImage(img, x + (w - dw) / 2, y + (h - dh) / 2, dw, dh);
 }
 
-function drawOutsideLabelBand(ctx, text, x, y, w, bgColor) {
+function drawReadableLineImage(ctx, img, x, y, w, h, bg = CANVAS_FILL) {
+  ctx.fillStyle = bg;
+  ctx.fillRect(x, y, w, h);
+  const iw = img.naturalWidth || img.width;
+  const ih = img.naturalHeight || img.height;
+  if (!iw || !ih) return;
+  const containScale = Math.min(w / iw, h / ih);
+  const imageRatio = iw / ih;
+  const frameRatio = w / h;
+  const isTallPhoto = imageRatio < frameRatio * 0.72;
+  const scale = isTallPhoto ? Math.min(Math.max(containScale * 1.28, containScale), w / iw) : containScale;
+  const dw = iw * scale;
+  const dh = ih * scale;
+  const dx = x + (w - dw) / 2;
+  const dy = y + (h - dh) / 2;
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(x, y, w, h);
+  ctx.clip();
+  ctx.drawImage(img, dx, dy, dw, dh);
+  ctx.restore();
+}
+
+function drawOutsideLabelBand(ctx, text, x, y, w, bgColor, textColor = "#ffffff", borderColor = "") {
   ctx.fillStyle = bgColor;
   ctx.fillRect(x, y, w, LINE_LABEL_BAND_H);
-  ctx.fillStyle = "#fff";
+  if (borderColor) {
+    ctx.strokeStyle = borderColor;
+    ctx.lineWidth = 3;
+    ctx.strokeRect(x + 1.5, y + 1.5, w - 3, LINE_LABEL_BAND_H - 3);
+  }
+  ctx.fillStyle = textColor;
   ctx.font = "700 28px sans-serif";
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
@@ -1855,30 +2610,6 @@ function analyzeJobAlbumPoints(job) {
   return analyzeJobAlbumPointsFromPoints(job.dirtPoints);
 }
 
-function drawMessageBlock(ctx, messageText, x, y, w) {
-  const lines = wrapMessageLines(messageText);
-  const blockH = estimateMessageBlockHeight(messageText);
-  ctx.fillStyle = "#f9fbfd";
-  ctx.fillRect(x, y, w, blockH);
-  ctx.strokeStyle = "#dde3ea";
-  ctx.strokeRect(x, y, w, blockH);
-  ctx.fillStyle = LABEL_AFTER_BG;
-  ctx.font = "700 24px sans-serif";
-  ctx.textAlign = "left";
-  ctx.textBaseline = "top";
-  ctx.fillText("お礼文", x + LINE_MESSAGE_PADDING, y + LINE_MESSAGE_PADDING);
-  ctx.fillStyle = "#1a1a1a";
-  ctx.font = "600 24px sans-serif";
-  lines.forEach((line, idx) => {
-    ctx.fillText(
-      line,
-      x + LINE_MESSAGE_PADDING,
-      y + LINE_MESSAGE_PADDING + LINE_MESSAGE_LABEL_H + idx * LINE_MESSAGE_LINE_H
-    );
-  });
-  return blockH;
-}
-
 async function renderJobAlbumCanvas(job, chunk, excluded, part, total, messageText) {
   const width = LINE_CANVAS_MAX_WIDTH;
   const splitLabel = total > 1;
@@ -1915,30 +2646,35 @@ async function renderJobAlbumCanvas(job, chunk, excluded, part, total, messageTe
 
   const margin = 24;
   const innerW = width - margin * 2;
-  y += drawMessageBlock(ctx, messageText, margin, y, innerW);
 
   for (const entry of chunk) {
-    const { beforeImg, afterImg } = await loadPointImages(entry);
+    const { beforeImg, afterImg, processImg } = await loadPointImages(entry);
+    ctx.fillStyle = LABEL_AFTER_BG;
+    ctx.fillRect(margin, y, innerW, LINE_POINT_NAME_H);
     drawCenteredText(
       ctx,
       entry.point.name,
       width / 2,
       y + LINE_POINT_NAME_H / 2,
       innerW,
-      "700 30px sans-serif"
+      "800 30px sans-serif",
+      "#ffffff"
     );
     y += LINE_POINT_NAME_H;
 
-    const colW = (innerW - LINE_POINT_COL_GAP) / 2;
-    const beforeX = margin;
-    const afterX = margin + colW + LINE_POINT_COL_GAP;
+    const slots = [
+      { label: "Before", img: beforeImg, color: LABEL_BEFORE_BG, textColor: LABEL_BEFORE_TEXT, borderColor: LABEL_BEFORE_TEXT },
+      { label: "After", img: afterImg, color: LABEL_AFTER_BG, textColor: LABEL_AFTER_TEXT },
+    ];
+    if (processImg) slots.push({ label: "作業中", img: processImg, color: "#5c6570" });
+    const colW = (innerW - LINE_POINT_COL_GAP * (slots.length - 1)) / slots.length;
     const rowTop = y;
 
-    y += drawOutsideLabelBand(ctx, "ビフォー", beforeX, y, colW, LABEL_BEFORE_BG);
-    drawContainImage(ctx, beforeImg, beforeX, y, colW, LINE_POINT_IMAGE_H);
-    const afterLabelY = rowTop;
-    drawOutsideLabelBand(ctx, "アフター", afterX, afterLabelY, colW, LABEL_AFTER_BG);
-    drawContainImage(ctx, afterImg, afterX, afterLabelY + LINE_LABEL_BAND_H, colW, LINE_POINT_IMAGE_H);
+    slots.forEach((slot, index) => {
+      const x = margin + index * (colW + LINE_POINT_COL_GAP);
+      drawOutsideLabelBand(ctx, slot.label, x, rowTop, colW, slot.color, slot.textColor, slot.borderColor);
+      drawReadableLineImage(ctx, slot.img, x, rowTop + LINE_LABEL_BAND_H, colW, LINE_POINT_IMAGE_H);
+    });
     y = rowTop + LINE_LABEL_BAND_H + LINE_POINT_IMAGE_H + LINE_POINT_GAP;
   }
 
@@ -1990,7 +2726,7 @@ async function createJobAlbumBlobs(job, messageText) {
   syncPointsFromForm(job);
   const { included, excluded } = analyzeJobAlbumPointsFromPoints(job.dirtPoints);
   if (included.length === 0) {
-    throw new Error("ビフォー/アフターが揃った洗う場所がありません。");
+    throw new Error("Before / After が揃った洗う場所がありません。");
   }
 
   let chunks = splitIncludedPoints(included);
@@ -2027,6 +2763,7 @@ async function createJobAlbumBlobs(job, messageText) {
         size: sized.size,
         part: partPlan.part,
         total: partPlan.total,
+        filename: `${String(partPlan.part).padStart(2, "0")}_${safeFilePart(partPlan.included[0]?.point?.name || "作業写真")}.jpg`,
         withinTarget: sized.withinTarget,
       });
     }
@@ -2043,7 +2780,7 @@ async function createLineCompositeBlob(job, pointIndex) {
   const beforeRef = photos.before;
   const afterRef = photos.after;
   if (!beforeRef?.photoId || !afterRef?.photoId) {
-    throw new Error("ビフォーとアフターの両方が必要です");
+    throw new Error("Before と After の両方が必要です");
   }
   const beforeBlob = await getPhotoBlob(beforeRef.photoId);
   const afterBlob = await getPhotoBlob(afterRef.photoId);
@@ -2087,11 +2824,11 @@ async function createLineCompositeBlob(job, pointIndex) {
   const afterX = margin + imageW + gap;
 
   let rowY = imageY;
-  rowY += drawOutsideLabelBand(ctx, "ビフォー", beforeX, rowY, imageW, LABEL_BEFORE_BG);
-  drawContainImage(ctx, beforeImg, beforeX, rowY, imageW, imageAreaH - LINE_LABEL_BAND_H);
+  rowY += drawOutsideLabelBand(ctx, "Before", beforeX, rowY, imageW, LABEL_BEFORE_BG, LABEL_BEFORE_TEXT, LABEL_BEFORE_TEXT);
+  drawReadableLineImage(ctx, beforeImg, beforeX, rowY, imageW, imageAreaH - LINE_LABEL_BAND_H);
   rowY = imageY;
-  rowY += drawOutsideLabelBand(ctx, "アフター", afterX, rowY, imageW, LABEL_AFTER_BG);
-  drawContainImage(ctx, afterImg, afterX, rowY, imageW, imageAreaH - LINE_LABEL_BAND_H);
+  rowY += drawOutsideLabelBand(ctx, "After", afterX, rowY, imageW, LABEL_AFTER_BG, LABEL_AFTER_TEXT);
+  drawReadableLineImage(ctx, afterImg, afterX, rowY, imageW, imageAreaH - LINE_LABEL_BAND_H);
 
   ctx.fillStyle = CANVAS_FILL;
   ctx.fillRect(0, height - LINE_FOOTER_H, width, LINE_FOOTER_H);
@@ -2116,23 +2853,29 @@ async function createLineCompositeBlob(job, pointIndex) {
 async function downloadLineCompositeForPoint(job, pointIndex) {
   const { blob, point, size } = await createLineCompositeBlob(job, pointIndex);
   const filename = lineCompositeFilename(job, point);
-  downloadBlobFile(blob, filename);
+  await saveBlobForUser(blob, filename, {
+    preferShare: isAppleMobileDevice(),
+    disableShare: isAppleMobileDevice(),
+    fallbackToDownloadOnShareError: true,
+  });
   return { filename, size };
 }
 
 async function shareLineCompositeForPoint(job, pointIndex) {
   const { blob, point, size } = await createLineCompositeBlob(job, pointIndex);
   const filename = lineCompositeFilename(job, point);
-  const file = new File([blob], filename, { type: "image/jpeg" });
+  const file = buildImageFile(blob, filename);
   if (canShareFiles([file])) {
     await navigator.share({
       files: [file],
-      title: `${job.customerName} ビフォーアフター`,
-      text: LINE_TEST_TEMPLATE,
     });
     return { mode: "share", size };
   }
-  downloadBlobFile(blob, filename);
+  await saveBlobForUser(blob, filename, {
+    preferShare: isAppleMobileDevice(),
+    disableShare: isAppleMobileDevice(),
+    fallbackToDownloadOnShareError: true,
+  });
   return { mode: "download_fallback", size };
 }
 
@@ -2140,7 +2883,11 @@ async function downloadJobAlbumFromBlobs(job, blobs) {
   const names = [];
   for (const item of blobs) {
     const filename = lineAlbumFilename(job, item.part, item.total);
-    downloadBlobFile(item.blob, filename);
+    await saveBlobForUser(item.blob, filename, {
+      preferShare: isAppleMobileDevice(),
+      disableShare: isAppleMobileDevice(),
+      fallbackToDownloadOnShareError: true,
+    });
     names.push(`${filename} (${Math.round(item.size / 1024)}KB)`);
     await new Promise((r) => setTimeout(r, 300));
   }
@@ -2197,10 +2944,10 @@ function updateAlbumPanelUi(job) {
   const included = analyzeJobAlbumPoints(job).included.length;
   const messageValidation = validateLineAlbumMessage(getLineAlbumMessageText(job));
   const messageValid = messageValidation.ok;
-  const canShareCheckedAlbum = isAlbumShareEnabled(entry.status) && canShareAlbumBlobs(job, entry.blobs);
+  const canUseCheckedAlbum = isAlbumShareEnabled(entry.status) && entry.blobs.length > 0;
+  const canShareCheckedAlbum = canUseCheckedAlbum && canShareAlbumBlobs(job, entry.blobs);
   const checkBtn = document.getElementById("btn-job-album-check");
-  const shareBtn = document.getElementById("btn-job-album-share");
-  const saveBtn = document.getElementById("btn-job-album-save");
+  const shareSaveBtn = document.getElementById("btn-job-album-share-save");
   const statusEl = document.getElementById("album-check-status");
   const previewImages = document.getElementById("job-album-image-preview");
   const summary = document.getElementById("job-album-preview");
@@ -2216,33 +2963,25 @@ function updateAlbumPanelUi(job) {
           ? "warn"
           : "info";
     if (included === 0) {
-      statusText = "画像チェック: ビフォー/アフターが揃った洗う場所がありません";
+      statusText = "画像チェック: Before / After が揃った洗う場所がありません";
       statusClass = "warn";
     } else if (!messageValid) {
       statusText = `画像チェック: ${messageValidation.message}`;
       statusClass = "warn";
-    } else if (isAlbumShareEnabled(entry.status) && !canShareCheckedAlbum) {
-      statusText = "画像チェック: 確認済み。ただしこの端末では直接共有できません。保存して写真アプリからLINEへ添付してください。";
-      statusClass = "warn";
+    } else if (canUseCheckedAlbum && !canShareCheckedAlbum) {
+      statusText = "画像チェック: 確認済み。ボタンを押すと保存用に開きます。写真アプリまたはファイルからLINEへ添付してください。";
+      statusClass = "ok";
     }
     statusEl.textContent = statusText;
     statusEl.className = `save-status save-status-${statusClass}`;
   }
   if (checkBtn) checkBtn.disabled = !(included > 0 && messageValid);
-  if (shareBtn) {
-    shareBtn.disabled = !canShareCheckedAlbum;
-    shareBtn.title = canShareCheckedAlbum
-      ? "確認済みの一括画像を共有します"
-      : isAlbumShareEnabled(entry.status)
-        ? "この端末では直接共有できません。保存して写真アプリからLINEへ添付してください。"
-        : "先に画像チェックを完了してください";
-  }
-  if (saveBtn) {
-    const showSave =
-      isAlbumShareEnabled(entry.status) &&
-      (!canShareCheckedAlbum || albumSaveFallbackVisible.has(job.jobId));
-    saveBtn.hidden = !showSave;
-    saveBtn.disabled = !isAlbumShareEnabled(entry.status);
+  if (shareSaveBtn) {
+    shareSaveBtn.disabled = !canUseCheckedAlbum;
+    shareSaveBtn.textContent = "一括画像を出力";
+    shareSaveBtn.title = canUseCheckedAlbum
+      ? "確認済みの一括画像を共有シートまたは保存先へ出力します"
+      : "先に画像チェックを完了してください";
   }
 }
 
@@ -2274,7 +3013,7 @@ async function handleAlbumImageCheck(job) {
     updateAlbumPanelUi(job);
     const sizeText = result.blobs.map((b) => `${Math.round(b.size / 1024)}KB`).join(" / ");
     setDetailStatus(
-      `画像チェックOK。${result.blobs.length}枚（${sizeText}）。内容を確認してから「一括画像を共有」を押してください。${saved ? "" : " お礼文のブラウザ保存は未確認です。"}`,
+      `画像チェックOK。${result.blobs.length}枚（${sizeText}）。画像にはお礼文を入れず、出力時にLINE本文として先に渡します。${saved ? "" : " お礼文のブラウザ保存は未確認です。"}`,
       saved ? "ok" : "warn"
     );
     return result;
@@ -2303,9 +3042,10 @@ async function shareCachedJobAlbum(job) {
   const files = albumFilesFromBlobs(job, entry.blobs);
 
   if (canShareFiles(files)) {
+    const messageText = getLineAlbumMessageText(job).trim();
     await navigator.share({
       files,
-      title: `${job.customerName} LINE送信用`,
+      text: messageText,
     });
     return {
       mode: "share",
@@ -2313,7 +3053,13 @@ async function shareCachedJobAlbum(job) {
       sizes: entry.blobs.map((b) => b.size),
     };
   }
-  throw new Error("この端末では直接共有できません。表示された保存ボタンで保存して、写真アプリからLINEへ添付してください。");
+  const names = await downloadJobAlbumFromBlobs(job, entry.blobs);
+  return {
+    mode: "download",
+    count: names.length,
+    names,
+    sizes: entry.blobs.map((b) => b.size),
+  };
 }
 
 function wireAlbumPanelHandlers(job) {
@@ -2344,8 +3090,8 @@ function wireAlbumPanelHandlers(job) {
     }
   });
 
-  document.getElementById("btn-job-album-share")?.addEventListener("click", async () => {
-    const btn = document.getElementById("btn-job-album-share");
+  document.getElementById("btn-job-album-share-save")?.addEventListener("click", async () => {
+    const btn = document.getElementById("btn-job-album-share-save");
     if (btn.disabled) {
       setDetailStatus("先に「画像チェック」を完了してください。", "warn");
       return;
@@ -2360,43 +3106,23 @@ function wireAlbumPanelHandlers(job) {
             ? `${Math.round(result.sizes[0] / 1024)}KB`
             : `${result.count}枚`;
         setDetailStatus(
-          `共有画面を開きました（${sizeText}）。LINE 送信後、専用ボタンで送信済みにしてください。`,
+          `出力画面を開きました（${sizeText}）。LINE本文にお礼文、添付に画像が入る構成です。送信後、専用ボタンで送信済みにしてください。`,
           "ok"
         );
       } else {
-        setDetailStatus(`${result.splitMessage} ${result.names.join(" / ")}`, "warn");
+        setDetailStatus(
+          `保存用に出力しました。端末に表示された保存先、またはスクリーンショットからLINEへ添付してください: ${result.names.join(" / ")}`,
+          "ok"
+        );
       }
     } catch (e) {
       if (e?.name === "AbortError") {
-        albumSaveFallbackVisible.add(job.jobId);
         updateAlbumPanelUi(job);
-        setDetailStatus("共有をキャンセルしました。LINEが出ない場合は、表示された保存ボタンかスクリーンショットで送れます。", "warn");
+        setDetailStatus("出力をキャンセルしました。もう一度同じボタンからやり直せます。", "warn");
         return;
       }
-      albumSaveFallbackVisible.add(job.jobId);
       updateAlbumPanelUi(job);
-      setDetailStatus(`一括画像の共有に失敗しました: ${e.message}`, "warn");
-    } finally {
-      updateAlbumPanelUi(job);
-    }
-  });
-
-  document.getElementById("btn-job-album-save")?.addEventListener("click", async () => {
-    const btn = document.getElementById("btn-job-album-save");
-    const entry = syncAlbumCheckEntry(job);
-    if (!isAlbumShareEnabled(entry.status)) {
-      setDetailStatus("先に「画像チェック」を完了してください。", "warn");
-      return;
-    }
-    try {
-      btn.disabled = true;
-      const names = await downloadJobAlbumFromBlobs(job, entry.blobs);
-      setDetailStatus(
-        `一括画像を保存しました。写真アプリから LINE へ添付してください: ${names.join(" / ")}`,
-        "ok"
-      );
-    } catch (e) {
-      setDetailStatus(`一括画像の保存に失敗しました: ${e.message}`, "warn");
+      setDetailStatus(`一括画像の出力に失敗しました: ${e.message}`, "warn");
     } finally {
       updateAlbumPanelUi(job);
     }
@@ -2429,13 +3155,45 @@ function canSharePhotoFiles() {
   }
 }
 
-function downloadBlobFile(blob, filename) {
+function buildImageFile(blob, filename) {
+  return new File([blob], filename, { type: blob.type || "image/jpeg" });
+}
+
+async function saveBlobForUser(blob, filename, options = {}) {
+  const {
+    preferShare = false,
+    shareTitle = "",
+    disableShare = false,
+    fallbackToDownloadOnShareError = false,
+  } = options;
+  const file = buildImageFile(blob, filename);
+
+  if (preferShare && !disableShare && canShareFiles([file])) {
+    try {
+      await navigator.share({
+        files: [file],
+        title: shareTitle || filename,
+        text: filename,
+      });
+      return "shared";
+    } catch (error) {
+      if (!fallbackToDownloadOnShareError) throw error;
+    }
+  }
+
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
   a.download = filename;
+  a.rel = "noopener";
+  if (isAppleMobileDevice()) {
+    a.target = "_blank";
+  }
+  document.body.appendChild(a);
   a.click();
+  a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 60 * 1000);
+  return "download";
 }
 
 async function downloadPhotoForLine(job, pointIndex, kind) {
@@ -2445,8 +3203,13 @@ async function downloadPhotoForLine(job, pointIndex, kind) {
   if (!ref?.photoId) throw new Error("写真がありません");
   const blob = await getPhotoBlob(ref.photoId);
   if (!blob) throw new Error("写真データがありません");
-  downloadBlobFile(blob, photoExportFilename(job, point, kind));
-  return photoExportFilename(job, point, kind);
+  const filename = photoExportFilename(job, point, kind);
+  await saveBlobForUser(blob, filename, {
+    preferShare: isAppleMobileDevice(),
+    disableShare: isAppleMobileDevice(),
+    fallbackToDownloadOnShareError: true,
+  });
+  return filename;
 }
 
 async function sharePhotoForLine(job, pointIndex, kind) {
@@ -2461,12 +3224,16 @@ async function sharePhotoForLine(job, pointIndex, kind) {
   if (canShareFiles([file])) {
     await navigator.share({
       files: [file],
-      title: `${job.customerName} ${photoSlotLabel(kind)}`,
-      text: `${job.customerName} ${photoSlotLabel(kind)}`,
+      title: `${customerDisplayName(job.customerName)} ${photoSlotLabel(kind)}`,
+      text: `${customerDisplayName(job.customerName)} ${photoSlotLabel(kind)}`,
     });
     return "share";
   }
-  downloadBlobFile(blob, filename);
+  await saveBlobForUser(blob, filename, {
+    preferShare: isAppleMobileDevice(),
+    disableShare: isAppleMobileDevice(),
+    fallbackToDownloadOnShareError: true,
+  });
   return "download_fallback";
 }
 
@@ -2587,7 +3354,7 @@ async function shareReportFile(job) {
     const canShareFile = window.isSecureContext && navigator.canShare?.({ files: [file] }) && navigator.share;
     if (!canShareFile) {
       setReportSaveStatus(
-        "この接続ではスマホのファイル保存/共有に対応していません。画像の内容は確認画面で確認できます。HTML保存はPCまたはHTTPS環境で確認してください。",
+        "この接続ではスマホのファイル保存/共有に対応していません。試用では、この確認画面が表示できれば合格です。HTML保存はPCまたはHTTPS環境で確認してください。",
         "warn"
       );
       return;
@@ -2618,7 +3385,7 @@ async function renderReportPreview(job) {
     </article>
     <section class="card save-panel">
       <h2>保存/共有</h2>
-      <p class="hint">この画面では写真の内容を確認できます。HTMLファイル保存は端末・ブラウザ・接続方式に左右されます。</p>
+      <p class="hint">スマホ試用では、この画面に写真が表示できれば合格です。HTMLファイル保存は端末・ブラウザ・接続方式に左右されます。</p>
       <p id="report-save-status" class="save-status save-status-info">未実行</p>
     </section>
     <div class="btn-row">
@@ -2647,21 +3414,32 @@ function renderDetail() {
     render();
     return;
   }
+  const formState = hydrateDetailFormState(j) || getActiveDetailDraft(j.jobId);
+  hydrateDraftToJob(j);
+  const latestFormState = formState || getActiveDetailDraft(j.jobId);
+  if (latestFormState && latestFormState.jobId === j.jobId) {
+    applyDetailFormStateToJob(j, latestFormState);
+  }
+  const defaultWorkDate = normalizeDateInputValue(j.workDate, todayYmd());
+  const defaultSendDate = normalizeDateInputValue(j.sendPlannedDate, defaultWorkDate);
+  j.workDate = defaultWorkDate;
+  j.sendPlannedDate = defaultSendDate < defaultWorkDate ? defaultWorkDate : defaultSendDate;
   const rate = completionRate(j);
   if (!Array.isArray(j.dirtPoints)) j.dirtPoints = [];
   const pointsHtml = j.dirtPoints
     .map(
       (p, i) => `
-    <li class="point-row" data-point-row="${i}">
+          <li class="point-row" data-point-row="${i}">
       <div class="point-section-heading" aria-label="洗う場所 ${i + 1} の入力欄">
         <span class="point-section-kicker">洗う場所 ${i + 1}</span>
         <span class="point-section-guide">この枠内が1つの作業入力です</span>
       </div>
       <div class="point-main">
         <label class="point-check">
-          <input type="checkbox" data-point-idx="${i}" ${p.manualCompletedChecked ? "checked" : ""} aria-label="${escapeHtml(p.name)} 完了">
-          <span>完了</span>
+          <input type="checkbox" data-point-idx="${i}" ${p.manualCompletedChecked ? "checked" : ""} aria-label="${escapeHtml(p.name)} 作業完了">
+          <span>作業完了</span>
         </label>
+        <small class="point-check-desc">作業中の進捗チェックです。送信条件には影響しません。</small>
         <input type="text" class="point-name" data-point-name-idx="${i}" value="${escapeHtml(p.name)}" aria-label="洗う場所名 ${i + 1}">
         <button type="button" class="btn point-remove" data-point-remove-idx="${i}">削除</button>
       </div>
@@ -2672,33 +3450,37 @@ function renderDetail() {
 
   syncAlbumCheckEntry(j);
   const albumSummary = renderAlbumSummaryHtml(j);
-  const messageText = j.lineAlbum?.messageText || LINE_TEST_TEMPLATE;
+  const messageText = normalizeLineMessageText(j.lineAlbum?.messageText || LINE_TEST_TEMPLATE);
+  const customerInputValue = normalizeCustomerNameInput(j.customerName || "");
   main.innerHTML = `
     <div class="back-bar">
       <button type="button" class="btn" id="btn-back">← 戻る</button>
     </div>
     <div class="detail-header card">
-      <h2>${escapeHtml(j.customerName)}</h2>
-      <p class="card-meta">${escapeHtml(serviceLabel(j.serviceCode))}</p>
+      <h2>${renderCustomerName(j.customerName)}</h2>
+      ${renderCustomerNameHint(j.customerName)}
+      <p class="card-meta">作業内容: ${escapeHtml(serviceLabel(j.serviceCode))}</p>
       ${renderJobStatusBadges(j)}
-      <p class="rate">洗う場所 手動完了 ${rate.done}/${rate.total}（${rate.pct}%）</p>
+      <p class="rate">作業進捗（作業完了） ${rate.done}/${rate.total}（${rate.pct}%）</p>
+      <p class="point-check-guide">作業進捗（作業完了）と写真状態は別管理です。写真状態は「写真未確認／確認済み」「LINE写真の状態」で判定します。</p>
     </div>
     <div class="card">
       <div class="field">
         <label>お客様名</label>
-      <input type="text" id="f-customerName" value="${escapeHtml(j.customerName || "")}" placeholder="例: 顧客名">
+      <input type="text" id="f-customerName" value="${escapeHtml(customerInputValue)}" placeholder="${escapeHtml(CUSTOMER_NAME_INPUT_PLACEHOLDER)}">
       </div>
       <div class="field">
         <label>作業内容</label>
-        <select id="f-serviceCode">${serviceOptionsHtml(j.serviceCode || DEFAULT_SERVICE_CODE)}</select>
+        <select id="f-serviceCode" class="service-select">${serviceOptionsHtml(j.serviceCode || DEFAULT_SERVICE_CODE)}</select>
+        <p class="hint">作業内容はカテゴリごとにまとめてあります。</p>
       </div>
       <div class="field">
         <label>作業日</label>
-        <input type="date" id="f-workDate" value="${escapeHtml((j.workDate || "").slice(0, 10))}">
+        <input type="date" id="f-workDate" value="${escapeHtml(j.workDate)}">
       </div>
       <div class="field">
         <label>送信予定日</label>
-        <input type="date" id="f-sendPlannedDate" value="${escapeHtml((j.sendPlannedDate || "").slice(0, 10))}">
+        <input type="date" id="f-sendPlannedDate" value="${escapeHtml(j.sendPlannedDate)}" min="${escapeHtml(j.workDate)}">
       </div>
       <input type="hidden" id="f-photoStorage" value="${escapeHtml(j.photoStorage || BETA_LOCAL_STORAGE_LABEL)}">
       <p class="hint beta-local-note">写真はこの端末のブラウザ内に保存します。外部連携の設定は不要です。</p>
@@ -2718,13 +3500,13 @@ function renderDetail() {
     </div>
     <div class="card">
       <h2>LINE手動送付</h2>
-      <p class="hint">今日 LINE で送る一覧から消す操作はここだけです。自動送信はしません。LINEへは人が貼り付け・添付します。</p>
+      <p class="hint">ここではお礼文と一括画像の出力まで行います。送信後は「今日 LINE で送る」で作業完了として消します。</p>
       <div class="line-album-panel">
         <h3>このお客様分を1枚にまとめる</h3>
         <div class="field">
           <label for="f-line-album-message">LINEに貼るお礼文</label>
           <textarea id="f-line-album-message" class="line-album-message" rows="4" maxlength="${LINE_MESSAGE_MAX_CHARS}">${escapeHtml(messageText)}</textarea>
-          <p class="hint">LINE本文としてコピーできます。一括画像の冒頭にも入ります（最大 ${LINE_MESSAGE_MAX_CHARS} 文字）。</p>
+          <p class="hint">一括画像を出力すると、LINE本文として画像より前に入ります。画像の中には入れません（最大 ${LINE_MESSAGE_MAX_CHARS} 文字）。</p>
         </div>
         <div class="btn-row">
           <button type="button" class="btn btn-small" id="btn-copy-line-message">お礼文をコピー</button>
@@ -2734,35 +3516,24 @@ function renderDetail() {
         <div id="job-album-image-preview"></div>
         <div class="btn-row">
           <button type="button" class="btn btn-small btn-primary" id="btn-job-album-check">画像チェック</button>
-          <button type="button" class="btn btn-small" id="btn-job-album-share" disabled>一括画像を共有</button>
-          <button type="button" class="btn btn-small" id="btn-job-album-save" hidden disabled>一括画像を保存（LINEが出ない時）</button>
-        </div>
-        <p class="hint android-fallback">iPhoneで共有先にLINEが出ない場合: 「一括画像を保存（LINEが出ない時）」で保存、またはプレビューをスクリーンショットしてLINEへ添付してください。</p>
+        <button type="button" class="btn btn-small" id="btn-job-album-share-save" disabled>一括画像を出力</button>
+      </div>
+        <p class="hint android-fallback">iPhoneでは同じボタンから共有シートを開きます。LINEが出ない場合は、表示された保存先に従うか、プレビューをスクリーンショットしてLINEへ添付してください。</p>
       </div>
       <ol class="action-steps">
-        <li>お礼文を入力して、必要ならコピーする</li>
-        <li>画像チェックでプレビューを確認する</li>
-        <li>一括画像を共有して LINE に手動送信する</li>
-        <li>下の専用チェックを入れて専用ボタンを押す</li>
+        <li>お礼文を入力する</li>
+        <li>画像チェックで、お礼文なしの画像プレビューを確認する</li>
+        <li>一括画像を出力して、LINE本文のお礼文と画像を手動送信する</li>
       </ol>
-      <label class="confirm-check">
-        <input type="checkbox" id="f-line-photo-sent-confirm" ${j.linePhotoSent === "済" ? "checked disabled" : ""}>
-        <span>自分用LINEへ送信済み。今日 LINE で送る一覧から消してよい。</span>
-      </label>
-      <p id="line-photo-sent-ready" class="save-status save-status-warn">まだ今日 LINE で送る一覧から消しません。LINE 送信後にチェックを入れてください。</p>
-      <div class="btn-row">
-        ${isDevMode() ? `<button type="button" class="btn" id="btn-copy-line-template">お礼文テンプレをコピー（開発者）</button>` : ""}
-        <button type="button" class="btn btn-primary" id="btn-mark-line-photo-sent" data-already-sent="${j.linePhotoSent === "済" ? "true" : "false"}" ${j.linePhotoSent === "済" ? "disabled" : ""}>LINE送信済みにして保存（今日 LINE で送る一覧から消す）</button>
-      </div>
-      <p class="hint">共有だけでは LINE写真=送信済み になりません。消すときは専用ボタンだけを使います。</p>
+      ${isDevMode() ? `<div class="btn-row"><button type="button" class="btn" id="btn-copy-line-template">お礼文テンプレをコピー（開発者）</button></div>` : ""}
+      <p class="hint">LINE送信後は、「今日 LINE で送る」で対象のお客様を作業完了として消してください。</p>
       <p id="detail-status" class="save-status save-status-info">画像チェック / 共有の結果がここに表示されます</p>
-      <p id="save-result" class="save-status save-status-info" hidden></p>
     </div>
     ${
       isDevMode()
         ? `<div class="card card-dev">
       <h2>確認HTML（開発者モード）</h2>
-      <p class="hint">開発者向け機能。?dev=1 の表示切替のみ（パスワード保護ではありません）。</p>
+      <p class="hint">試用外機能。?dev=1 の表示切替のみ（パスワード保護ではありません）。</p>
       <div class="btn-row">
         <button type="button" class="btn" id="btn-open-report">確認画面を表示</button>
         <button type="button" class="btn" id="btn-download-report">HTMLを保存</button>
@@ -2770,15 +3541,56 @@ function renderDetail() {
     </div>`
         : ""
     }
-    <button type="button" class="btn btn-primary" id="btn-save-detail">保存</button>
   `;
+  const activeFormState = latestFormState && latestFormState.jobId === j.jobId ? latestFormState : null;
+  if (activeFormState) {
+    applyDetailFormStateToDom(j, activeFormState);
+  }
 
   document.getElementById("btn-back").addEventListener("click", () => {
+    commitActiveDetailFormBeforeLeaving();
     detailJobId = null;
     if (window.location.hash.startsWith("#job=")) {
       history.replaceState(null, "", window.location.pathname + window.location.search);
     }
     render();
+  });
+
+  const topCustomerNameInput = document.getElementById("f-customerName");
+  wireCustomerNameInput(topCustomerNameInput, j);
+  syncSendPlannedDateToWorkDate(j, { force: false });
+
+  const topServiceSelect = document.getElementById("f-serviceCode");
+  topServiceSelect?.addEventListener("change", () => {
+    syncTopFormToJob(j);
+    rememberCurrentDetailFormState(j);
+    setDetailDraftFromJob(j);
+    queueDetailAutoSave(j, 0);
+    renderDetail();
+  });
+
+  const topWorkDateInput = document.getElementById("f-workDate");
+  const handleWorkDateChange = () => {
+    syncSendPlannedDateToWorkDate(j, { force: true });
+    persistDetailFormState(j);
+    queueDetailAutoSave(j, 0);
+  };
+  topWorkDateInput?.addEventListener("input", handleWorkDateChange);
+  topWorkDateInput?.addEventListener("change", handleWorkDateChange);
+
+  const topSendPlannedDateInput = document.getElementById("f-sendPlannedDate");
+  const handleSendPlannedDateChange = () => {
+    syncSendPlannedDateToWorkDate(j, { force: false });
+    persistDetailFormState(j);
+    queueDetailAutoSave(j, 0);
+  };
+  topSendPlannedDateInput?.addEventListener("input", handleSendPlannedDateChange);
+  topSendPlannedDateInput?.addEventListener("change", handleSendPlannedDateChange);
+
+  const topMessageInput = document.getElementById("f-line-album-message");
+  topMessageInput?.addEventListener("input", () => {
+    persistDetailFormState(j);
+    updateAlbumPanelUi(j);
   });
 
   main.querySelectorAll("[data-point-idx]").forEach((cb) => {
@@ -2787,21 +3599,23 @@ function renderDetail() {
       if (j.dirtPoints[idx]) {
         j.dirtPoints[idx].manualCompletedChecked = cb.checked;
       }
+      persistDetailFormState(j);
+    });
+  });
+
+  main.querySelectorAll("[data-point-name-idx]").forEach((input) => {
+    input.addEventListener("input", () => {
+      persistDetailFormState(j);
+      updateAlbumPanelUi(j);
     });
   });
 
   main.querySelectorAll("[data-point-remove-idx]").forEach((btn) => {
     btn.addEventListener("click", async () => {
       if (!armDeleteButton(btn)) return;
+      persistDetailFormState(j);
       await handlePointDelete(j, Number(btn.dataset.pointRemoveIdx));
     });
-  });
-
-  document.getElementById("btn-add-point").addEventListener("click", () => {
-    syncPointsFromForm(j);
-    const idx = j.dirtPoints.length;
-    j.dirtPoints.push(normalizePoint({ name: `ポイント${idx + 1}` }, idx, j.jobId));
-    renderDetail();
   });
 
   document.getElementById("btn-open-report")?.addEventListener("click", () => {
@@ -2828,6 +3642,7 @@ function renderDetail() {
     btn.addEventListener("click", async () => {
       if (!armDeleteButton(btn)) return;
       const [pointIndexText, kind] = btn.dataset.photoDelete.split(":");
+      persistDetailFormState(j);
       await handlePhotoDelete(j, Number(pointIndexText), kind);
     });
   });
@@ -2861,56 +3676,6 @@ function renderDetail() {
     handleMarkPhotoVerified(j);
   });
 
-  document.getElementById("btn-mark-line-photo-sent")?.addEventListener("click", () => {
-    handleMarkLinePhotoSent(j);
-  });
-  document.getElementById("f-line-photo-sent-confirm")?.addEventListener("change", syncLinePhotoSentButton);
-  syncLinePhotoSentButton();
-
-  document.getElementById("btn-save-detail").addEventListener("click", () => {
-    const saveButton = document.getElementById("btn-save-detail");
-    try {
-      setSaveButtonBusy(saveButton, true);
-      setDetailStatus("保存処理を開始しました。", "info");
-      setSaveResultElement("保存処理を開始しました。", "info");
-
-      const prevPhotoVerified = j.photoVerified;
-      applyDetailFormToJob(j);
-
-      setDetailStatus("保存中です。localStorage に書き込み、直後に読み戻して確認します。", "info");
-      setSaveResultElement("保存中です。保存実体を読み戻して確認します。", "info");
-
-      const checks = [{ jobId: j.jobId, field: "linePhotoSent", value: j.linePhotoSent }];
-      if (j.photoVerified !== prevPhotoVerified) {
-        checks.push({ jobId: j.jobId, field: "photoVerified", value: j.photoVerified });
-      }
-
-      const result = persistStateWithVerification(checks);
-      if (!result.ok) {
-        j.photoVerified = prevPhotoVerified;
-        const msg = showPersistFailure(result);
-        setDetailStatus(msg, "warn");
-        setSaveResultElement(msg, "fail");
-        return;
-      }
-
-      const evidence = buildPersistEvidence(j.jobId, result);
-      const msg = `保存しました。送る写真=${T.photoVerified[j.photoVerified]} / LINE写真=${T.linePhotoSent[j.linePhotoSent]} · 今日 LINE で送る ${result.todayCount} 件`;
-      setFlashSaveMessage(msg);
-      setSaveResultElement(evidence, "ok");
-      updatePhotoVerifyHint(j);
-      setDetailStatus(evidence, "ok");
-    } catch (e) {
-      const errText = `保存処理エラー: ${e.message}`;
-      console.error(errText, e);
-      showSaveFailure(errText);
-      setDetailStatus(errText, "warn");
-      setSaveResultElement(errText, "fail");
-    } finally {
-      setSaveButtonBusy(saveButton, false);
-    }
-  });
-
   updatePhotoVerifyHint(j);
   updateAlbumPanelUi(j);
   hydratePhotoThumbs(j, seq);
@@ -2932,7 +3697,7 @@ function renderData() {
           JSON を読み込む
           <input type="file" id="file-import" accept=".json,application/json" hidden>
         </label>
-        <button type="button" class="btn" id="btn-reset">空の見本データを再読込</button>
+        <button type="button" class="btn" id="btn-reset">ダミー3件を再読込</button>
       </div>
     </div>
     <div class="card">
@@ -2961,7 +3726,7 @@ function renderData() {
   document.getElementById("btn-export").addEventListener("click", exportJson);
   document.getElementById("file-import").addEventListener("change", importJson);
   document.getElementById("btn-reset").addEventListener("click", async () => {
-    if (!confirm("localStorage と端末内写真をリセットして、空の見本データを読み直しますか？")) return;
+    if (!confirm("localStorage と端末内写真をリセットして、ダミー3件を読み直しますか？")) return;
     try {
       await clearPhotoDb();
       await loadSample();
@@ -3035,12 +3800,13 @@ function importJson(ev) {
       const data = JSON.parse(reader.result);
       if (
         !confirm(
-          "アプリの保存データとして読み込みます。\n実在のお客様データや写真バイナリを含めていないことを確認してください。"
+          "Phase 0 の試用JSONとして読み込みます。\n実在のお客様データや写真バイナリを含めていないことを確認してください。"
         )
       ) {
         return;
       }
       setState(data);
+      clearAllDetailDrafts();
       const saved = saveLocal();
       alert(saved ? `読み込みました（${state.jobs.length} 件）` : `読み込みました（${state.jobs.length} 件）。ただしブラウザ保存に失敗しました。`);
       render();
@@ -3087,10 +3853,57 @@ function render() {
 }
 
 document.querySelectorAll(".nav-tab").forEach((btn) => {
-  btn.addEventListener("click", () => setView(btn.dataset.view));
+  btn.addEventListener("pointerdown", () => {
+    blurActiveDetailInput();
+  });
+  btn.addEventListener("click", (event) => {
+    event.preventDefault();
+    setView(btn.dataset.view);
+  });
 });
 
+["pointerup", "click"].forEach((eventName) => {
+  document.addEventListener(eventName, (event) => {
+    const target = event.target?.closest?.("#btn-save-new-manual-job");
+    if (!target) return;
+    event.preventDefault();
+    saveNewManualJobFromForm();
+  });
+});
+
+function handlePointAddCommand(event) {
+  const target = event.target?.closest?.("#btn-add-point");
+  if (!target) return;
+  if (event.type === "pointerdown") {
+    event.preventDefault();
+  }
+  const now = Date.now();
+  if (now - lastPointAddRunAt < 500) return;
+  const currentJob = findJob(detailJobId);
+  if (!currentJob) return;
+  lastPointAddRunAt = now;
+  handlePointAdd(currentJob);
+}
+
+main.addEventListener("pointerdown", handlePointAddCommand, true);
+main.addEventListener("click", handlePointAddCommand, true);
+
+function persistActiveJobDraft() {
+  const currentJob = findJob(detailJobId);
+  if (currentJob) {
+    syncDetailForm(currentJob);
+    setDetailDraftFromJob(currentJob);
+    saveLocal();
+  }
+}
+
+window.addEventListener("pagehide", persistActiveJobDraft);
+window.addEventListener("beforeunload", persistActiveJobDraft);
+
 window.addEventListener("hashchange", () => {
+  if (detailJobId) {
+    commitActiveDetailFormBeforeLeaving();
+  }
   if (!openJobFromHash()) render();
 });
 

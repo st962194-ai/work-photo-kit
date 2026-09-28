@@ -1,5 +1,5 @@
 /**
- * 今日 LINE で送る — R1a-S QUEUE FILTER と同一（データ定義_JSON §2）
+ * 今日 LINE で送る — 送信予定日が今日の案件だけを出す
  */
 export const BUSINESS_TIME_ZONE = "Asia/Tokyo";
 
@@ -39,11 +39,20 @@ function parseYmd(value) {
   return ymdFromParts(Number(m[1]), Number(m[2]), Number(m[3]));
 }
 
-function dateOnOrBefore(ymd, today) {
+function dateEquals(ymd, today) {
   const d = parseYmd(ymd);
   const t = parseYmd(today);
   if (!d || !t) return false;
-  return d <= t;
+  return d === t;
+}
+
+function effectiveSendDate(job) {
+  const workDate = parseYmd(job?.workDate);
+  const sendPlannedDate = parseYmd(job?.sendPlannedDate);
+  if (workDate && sendPlannedDate) {
+    return sendPlannedDate < workDate ? workDate : sendPlannedDate;
+  }
+  return sendPlannedDate || workDate || null;
 }
 
 function nonEmpty(value) {
@@ -54,11 +63,9 @@ export function isTodaySend(job, today = todayYmd()) {
   if (!job || typeof job !== "object") return false;
   return (
     nonEmpty(job.jobId) &&
-    job.photoVerified === "済" &&
     nonEmpty(job.photoStorage) &&
     job.linePhotoSent === "未" &&
-    (dateOnOrBefore(job.workDate, today) ||
-      dateOnOrBefore(job.sendPlannedDate, today))
+    dateEquals(effectiveSendDate(job), today)
   );
 }
 

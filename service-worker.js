@@ -1,12 +1,12 @@
-const CACHE_NAME = "photo-r1a-app-v20260530-2";
+const CACHE_NAME = "photo-r1a-app-v20260601-01";
 const APP_SHELL = [
   "./",
   "./index.html",
   "./version.json",
-  "./css/style.css?v=20260530-2",
-  "./js/app.js?v=20260530-2",
+  "./css/style.css?v=20260601-01",
+  "./js/app.js?v=20260601-01",
   "./js/filter.js",
-  "./js/lineAlbumLogic.js?v=20260530-2",
+  "./js/lineAlbumLogic.js?v=20260601-01",
   "./data/dummy_jobs_phase0.json",
   "./manifest.webmanifest",
   "./icons/icon-192.png",

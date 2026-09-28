@@ -373,6 +373,12 @@ textarea {
   border-color: var(--accent);
 }
 
+.btn-danger {
+  color: var(--warn);
+  border-color: #f2b8a2;
+  background: #fff7f2;
+}
+
 .btn:disabled,
 .btn[aria-busy="true"] {
   opacity: 0.65;
@@ -431,6 +437,75 @@ textarea {
   border-color: var(--border-strong);
 }
 
+.job-card-actions {
+  margin-top: 0.75rem;
+}
+
+.job-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.65rem;
+}
+
+.job-card-head h2 {
+  margin-top: 0;
+}
+
+.job-card-due,
+.job-card-done {
+  background: #f1f3f5;
+  border-color: #c7ced6;
+  color: #4f5963;
+}
+
+.job-card-done {
+  opacity: 0.78;
+}
+
+.job-card-due h2,
+.job-card-done h2,
+.job-card-due .card-meta,
+.job-card-done .card-meta,
+.job-card-due .rate,
+.job-card-done .rate {
+  color: #59636e;
+}
+
+.job-card-due .confirm-check,
+.job-card-done .confirm-check {
+  background: #f7f8fa;
+  border-color: #c7ced6;
+}
+
+.job-card-due .btn-primary,
+.job-card-done .btn-primary {
+  background: #7a858f;
+  border-color: #7a858f;
+  color: #ffffff;
+}
+
+.job-card-done .btn-primary {
+  background: #68727c;
+  border-color: #68727c;
+}
+
+.badge-state {
+  flex: 0 0 auto;
+  background: #d7dde3;
+  color: #4f5963;
+}
+
+.job-card-done .badge-state {
+  background: #b42318;
+  color: #ffffff;
+  border-color: #b42318;
+}
+
+.list-actions {
+  margin-bottom: 0.85rem;
+}
+
 .open-hint {
   margin: 0.65rem 0 0;
   padding: 0.55rem 0.75rem;
@@ -475,6 +550,20 @@ textarea {
   border-radius: 8px;
   background: #fff;
   color: var(--text);
+}
+
+.service-select {
+  appearance: none;
+  -webkit-appearance: none;
+}
+
+.service-option-group {
+  color: #243548;
+  font-weight: 700;
+}
+
+.service-option-item {
+  padding-left: 0.55rem;
 }
 
 .field input:focus,
@@ -587,6 +676,18 @@ textarea {
   color: var(--muted);
 }
 
+.point-check-desc {
+  color: var(--muted);
+  font-size: 0.75rem;
+  flex: 1 1 100%;
+  line-height: 1.35;
+}
+
+.point-check-guide {
+  margin: 0.35rem 0 0;
+  color: #41566f;
+}
+
 .point-name {
   flex: 1 1 180px;
   min-width: 0;
@@ -669,11 +770,11 @@ textarea {
   display: flex;
   align-items: center;
   justify-content: center;
-  min-height: 92px;
+  min-height: clamp(320px, 72vw, 560px);
   border-radius: 6px;
   border: 1px dashed var(--border-strong);
   background: #fff;
-  overflow: hidden;
+  overflow: visible;
   color: var(--muted);
   font-size: 0.82rem;
   text-align: center;
@@ -781,8 +882,11 @@ textarea {
 .photo-preview img {
   display: block;
   width: 100%;
-  max-height: 180px;
+  max-width: 100%;
+  max-height: min(76vh, 680px);
+  height: auto;
   object-fit: contain;
+  object-position: center;
 }
 
 .photo-button {
